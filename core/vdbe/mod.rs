@@ -48,10 +48,10 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
-            OpInitCdcVersionState, OpInsertState, OpInsertSubState, OpJournalModeState,
-            OpNewRowidState, OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState,
-            OpSeekState, OpTransactionState, VacuumIntoOpContext,
+            OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
+            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -384,6 +384,7 @@ pub struct OpHashProbeState {
 
 enum ActiveOpState {
     None,
+    ClearBtree(OpClearBtreeState),
     Delete(OpDeleteState),
     Destroy(OpDestroyState),
     IdxDelete(OpIdxDeleteState),
@@ -408,6 +409,7 @@ impl std::fmt::Debug for ActiveOpState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             ActiveOpState::None => "None",
+            ActiveOpState::ClearBtree(_) => "ClearBtree",
             ActiveOpState::Delete(_) => "Delete",
             ActiveOpState::Destroy(_) => "Destroy",
             ActiveOpState::IdxDelete(_) => "IdxDelete",
@@ -473,6 +475,12 @@ impl ActiveOpStateSlot {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
             deleted_record: None,
         }
+    );
+    active_state_accessor!(
+        clear_btree,
+        ClearBtree,
+        OpClearBtreeState,
+        OpClearBtreeState::CreateCursor
     );
     active_state_accessor!(
         destroy,

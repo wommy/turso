@@ -7,6 +7,7 @@ pub mod join;
 pub mod journal_mode;
 pub mod orderby_collation;
 pub mod raise;
+pub mod reindex;
 pub mod rowid_alias;
 pub mod savepoint;
 pub mod subjournal;
