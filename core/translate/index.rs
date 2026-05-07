@@ -916,11 +916,18 @@ pub fn resolve_sorted_columns(
 fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)> {
     let mut current = expr;
     let mut coll = None;
-    while let Expr::Collate(inner, seq) = current {
-        coll = Some(CollationSeq::new(seq.as_str())?);
-        current = inner.as_ref();
+    loop {
+        current = unwrap_parens(current)?;
+        match current {
+            Expr::Collate(inner, seq) => {
+                if coll.is_none() {
+                    coll = Some(CollationSeq::new(seq.as_str())?);
+                }
+                current = inner.as_ref();
+            }
+            _ => return Ok((coll, current)),
+        }
     }
-    Ok((coll, current))
 }
 
 /// For a given Index Expression, attempts to resolve it to a column position in the table.
