@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, str::FromStr as _};
+use std::cmp::Ordering;
 
 use turso_parser::ast::Expr;
 
@@ -12,10 +12,7 @@ use crate::{
 
 // TODO: in the future allow user to define collation sequences
 // Will have to meddle with ffi for this
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum_macros::Display, strum_macros::EnumString, Default,
-)]
-#[strum(ascii_case_insensitive)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, strum_macros::Display, Default)]
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
@@ -30,9 +27,17 @@ pub enum CollationSeq {
 
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
-        CollationSeq::from_str(collation).map_err(|_| {
-            crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
-        })
+        if collation.eq_ignore_ascii_case("BINARY") {
+            Ok(CollationSeq::Binary)
+        } else if collation.eq_ignore_ascii_case("NOCASE") {
+            Ok(CollationSeq::NoCase)
+        } else if collation.eq_ignore_ascii_case("RTRIM") {
+            Ok(CollationSeq::Rtrim)
+        } else {
+            Err(crate::LimboError::ParseError(format!(
+                "no such collation sequence: {collation}"
+            )))
+        }
     }
     #[inline]
     /// Returns the collation, defaulting to BINARY if unset
