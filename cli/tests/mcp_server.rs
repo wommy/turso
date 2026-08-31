@@ -143,6 +143,19 @@ fn http_server_serves_a_v2_client() {
     assert_eq!(mismatched.status, 400);
     assert_eq!(mismatched.json()["error"]["code"], -32020);
 
+    // streamable-http.mdx line 271-275: an unimplemented method is a 404 on
+    // the wire, not a 200 carrying a JSON-RPC error.
+    let unimplemented = post(
+        &address,
+        &[
+            ("MCP-Protocol-Version", PROTOCOL_V2),
+            ("Mcp-Method", "resources/read"),
+        ],
+        r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"file:///x"}}"#,
+    );
+    assert_eq!(unimplemented.status, 404, "{}", unimplemented.body);
+    assert_eq!(unimplemented.json()["error"]["code"], -32601);
+
     // A pre-v2 client sends none of the v2 routing headers.
     let legacy = post(
         &address,

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -28,7 +29,22 @@ use turso_sync_engine::server_proto::{
 /// How long one request may take to arrive. The old code set this straight on
 /// the socket; it now travels with the read limits so the read loop can act on
 /// it rather than fail the connection outright.
-const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total time a response may take to leave the socket, mirroring
+/// `cli/mcp/http.rs`'s `write_response_bounded`: a plain `write_all` is only
+/// bounded per individual write() call, so a client that drains a few bytes
+/// right before each write's own timeout keeps every write nominally
+/// succeeding while the response never finishes - and because this server
+/// handles one connection at a time (see `run`'s accept loop), that stalled
+/// write would block every other client too, the same way an unbounded read
+/// would. The budget is longer than the MCP server's because a pull-updates
+/// response can carry a whole database's worth of pages.
+const WRITE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a single write may block before the loop above rechecks the
+/// deadline and the shutdown signal.
+const WRITE_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
@@ -136,10 +152,12 @@ impl TursoSyncServer {
 
         let http_response = response.with_headers(cors_headers());
         let response_bytes = format_http_response(&http_response);
-        stream.write_all(&response_bytes)?;
-        stream.flush()?;
-
-        Ok(())
+        write_response_bounded(
+            &self.interrupt_count,
+            &mut stream,
+            &response_bytes,
+            WRITE_DEADLINE,
+        )
     }
 
     fn route(&self, request: HttpRequest) -> HttpResponse {
@@ -847,6 +865,44 @@ impl TursoSyncServer {
     }
 }
 
+/// Writes in small steps against an overall deadline instead of trusting a
+/// single `write_all` bounded only by a per-write socket timeout, and gives
+/// up as soon as the server is told to shut down - see `WRITE_DEADLINE` for
+/// why this exists. `deadline` is a parameter rather than always
+/// `WRITE_DEADLINE` so tests can use one far shorter than 120 seconds.
+fn write_response_bounded(
+    interrupt_count: &AtomicUsize,
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Duration,
+) -> Result<()> {
+    stream.set_write_timeout(Some(WRITE_POLL_TIMEOUT.min(deadline)))?;
+    let started = Instant::now();
+    let mut sent = 0;
+    while sent < bytes.len() {
+        if interrupt_count.load(Ordering::SeqCst) > 0 {
+            return Err(anyhow!(
+                "sync server interrupted while writing the response"
+            ));
+        }
+        if started.elapsed() > deadline {
+            return Err(anyhow!("writing the response took too long"));
+        }
+        match stream.write(&bytes[sent..]) {
+            Ok(0) => return Err(anyhow!("connection closed while writing the response")),
+            Ok(n) => sent += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    stream.flush()?;
+    Ok(())
+}
+
 struct MvccLogSnapshot {
     end_offset: u64,
     crc_by_offset: Vec<(u64, u32)>,
@@ -1148,5 +1204,68 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn write_response_bounded_gives_up_once_the_deadline_passes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = TcpStream::connect(address).expect("connect"); // never reads
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let interrupt_count = AtomicUsize::new(0);
+
+        // Bigger than typical socket buffers, so the write below genuinely
+        // blocks instead of the whole payload being buffered by the kernel.
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = Instant::now();
+
+        let result = write_response_bounded(
+            &interrupt_count,
+            &mut server_stream,
+            &payload,
+            Duration::from_millis(800),
+        );
+
+        assert!(result.is_err(), "a stalled client must not block forever");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline should have cut the write off quickly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn write_response_bounded_gives_up_once_interrupted() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = TcpStream::connect(address).expect("connect"); // never reads
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let interrupt_count = AtomicUsize::new(0);
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                write_response_bounded(
+                    &interrupt_count,
+                    &mut server_stream,
+                    &payload,
+                    Duration::from_secs(30),
+                )
+            });
+            thread::sleep(Duration::from_millis(200));
+            interrupt_count.store(1, Ordering::SeqCst);
+
+            let result = handle.join().expect("the writer thread does not panic");
+            assert!(
+                result.is_err(),
+                "an interrupted server must abandon a stalled write rather than wait out the deadline"
+            );
+        });
     }
 }

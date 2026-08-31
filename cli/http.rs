@@ -133,6 +133,14 @@ pub fn read_http_request(
             }
             continue;
         };
+        // The terminator can turn up in the very read that also pushes the
+        // buffer past the cap, which the check above never sees because it
+        // only runs while the terminator is still missing.
+        if header_end > MAX_HEADER_BYTES {
+            return Err(RequestError::Refused(format!(
+                "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
+            )));
+        }
         let headers = String::from_utf8_lossy(&request_data[..header_end]);
         // A chunked body has no Content-Length, so reading it as one would
         // silently treat the first chunk header as the body.
@@ -141,7 +149,7 @@ pub fn read_http_request(
                 "Chunked request bodies are not supported; send Content-Length".to_string(),
             ));
         }
-        if let Some(content_length) = parse_content_length(&headers) {
+        if let Some(content_length) = parse_content_length(&headers)? {
             if content_length > limits.max_body_bytes {
                 return Err(RequestError::Refused(format!(
                     "Request body of {content_length} bytes exceeds the {} byte limit",
@@ -166,6 +174,10 @@ pub fn read_http_request(
                 }
                 request_data.extend_from_slice(&buffer[..n]);
             }
+            // A client can pack more than its declared Content-Length into
+            // the same write; whatever comes after the promised length is
+            // the start of a next message (or garbage), never this body.
+            request_data.truncate(total_expected);
         }
         break;
     }
@@ -233,15 +245,35 @@ fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
     (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
 }
 
-fn parse_content_length(headers: &str) -> Option<usize> {
+/// RFC 9110 6.4.1: a message with an unparsable Content-Length, or with more
+/// than one that disagree, has ambiguous framing and MUST be treated as an
+/// unrecoverable error - picking one value (or falling back to "no body")
+/// would let this parser and whatever reads the resulting body disagree
+/// about where the request actually ends.
+fn parse_content_length(headers: &str) -> Result<Option<usize>, RequestError> {
+    let mut found = None;
     for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            let value = line.split(':').nth(1)?.trim();
-            return value.parse().ok();
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let value = value.trim();
+        let parsed: usize = value.parse().map_err(|_| {
+            RequestError::Refused(format!("Invalid Content-Length value: '{value}'"))
+        })?;
+        match found {
+            None => found = Some(parsed),
+            Some(existing) if existing == parsed => {}
+            Some(_) => {
+                return Err(RequestError::Refused(
+                    "Content-Length specified more than once with differing values".to_string(),
+                ))
+            }
         }
     }
-    None
+    Ok(found)
 }
 
 /// A client controls Content-Length, so the end of the body has to be computed
@@ -483,6 +515,106 @@ mod tests {
         assert!(
             matches!(&error, RequestError::Refused(reason) if reason.contains("Chunked")),
             "expected a refusal, got: {error}"
+        );
+    }
+
+    /// Rejecting any Transfer-Encoding outright, before Content-Length is even
+    /// looked at, already covers the classic CL/TE smuggling shape - a request
+    /// carrying both headers never reaches the point where the two could be
+    /// read as disagreeing framings.
+    #[test]
+    fn a_request_with_both_content_length_and_transfer_encoding_is_refused() {
+        let raw = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}";
+
+        let error = read_from_client(raw, &ReadLimits::any_size(Duration::from_secs(5)))
+            .err()
+            .expect("refused");
+
+        assert!(
+            matches!(&error, RequestError::Refused(reason) if reason.contains("Chunked")),
+            "expected a refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn bytes_past_content_length_are_not_treated_as_part_of_the_body() {
+        let raw = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}JUNKJUNKJUNK";
+
+        let request = read_from_client(raw, &ReadLimits::any_size(Duration::from_secs(5)))
+            .unwrap_or_else(|e| panic!("a well-formed request line and headers must parse: {e}"));
+
+        assert_eq!(
+            &request.body[..],
+            b"{}",
+            "the body must stop exactly at Content-Length, not at the end of what arrived"
+        );
+    }
+
+    #[test]
+    fn a_second_differing_content_length_is_refused() {
+        let raw = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 999999\r\n\r\nhello";
+
+        let error = read_from_client(raw, &ReadLimits::any_size(Duration::from_secs(5)))
+            .err()
+            .expect("refused");
+
+        assert!(
+            matches!(&error, RequestError::Refused(reason) if reason.contains("more than once")),
+            "expected a refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_identical_content_length_is_accepted() {
+        let raw =
+            b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
+
+        let request = read_from_client(raw, &ReadLimits::any_size(Duration::from_secs(5)))
+            .unwrap_or_else(|e| panic!("identical repeats do not disagree about framing: {e}"));
+
+        assert_eq!(&request.body[..], b"{}");
+    }
+
+    #[test]
+    fn an_unparsable_content_length_is_refused_rather_than_treated_as_bodyless() {
+        let raw = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\nsomebody";
+
+        let error = read_from_client(raw, &ReadLimits::any_size(Duration::from_secs(5)))
+            .err()
+            .expect("refused");
+
+        assert!(
+            matches!(&error, RequestError::Refused(reason) if reason.contains("Invalid Content-Length")),
+            "expected a refusal, got: {error}"
+        );
+    }
+
+    /// The size check used to run only while the terminator was still
+    /// missing, so headers that crossed MAX_HEADER_BYTES in the very read
+    /// that also delivered "\r\n\r\n" slipped through uncounted. This pads the
+    /// terminator to land just past the cap inside a single 8 KiB read (the
+    /// fixed buffer size `read_http_request` uses), which is exactly the read
+    /// the old check skipped.
+    #[test]
+    fn oversized_headers_are_refused_even_when_the_terminator_arrives_in_the_same_read() {
+        let prefix = "POST /mcp HTTP/1.1\r\nHost: x\r\nX-Pad: ";
+        let target_header_end = MAX_HEADER_BYTES + 200;
+        let mut raw = prefix.as_bytes().to_vec();
+        raw.resize(target_header_end, b'A');
+        raw.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            find_header_end(&raw, 0),
+            Some(target_header_end),
+            "test construction sanity check"
+        );
+
+        let error = read_from_client(&raw, &ReadLimits::any_size(Duration::from_secs(5)))
+            .err()
+            .expect("oversized headers must be refused even when the terminator arrives late");
+
+        assert!(
+            matches!(&error, RequestError::Refused(reason) if reason.contains("exceed")),
+            "expected a header-size refusal, got: {error}"
         );
     }
 

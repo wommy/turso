@@ -8,8 +8,8 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use super::protocol::{
-    JsonRpcError, JsonRpcResponse, HEADER_MISMATCH, PARSE_ERROR, PROTOCOL_V2, SUPPORTED_VERSIONS,
-    UNSUPPORTED_PROTOCOL_VERSION,
+    JsonRpcError, JsonRpcResponse, HEADER_MISMATCH, METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_V2,
+    SUPPORTED_VERSIONS, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use super::TursoMcpServer;
 use crate::http::{
@@ -233,10 +233,33 @@ fn post_response(server: &TursoMcpServer, request: &HttpRequest) -> HttpResponse
     }
 
     match server.handle_message(body) {
-        Some(response) => HttpResponse::new(200, "application/json", response.into_bytes()),
+        Some(response) => {
+            let status = status_for_message_response(&response);
+            HttpResponse::new(status, "application/json", response.into_bytes())
+        }
         // A notification is accepted and answered with nothing, so there is
         // no media type to claim either.
         None => HttpResponse::new(202, "", Vec::new()),
+    }
+}
+
+/// `handle_message` can fail after `check_headers` already passed - the
+/// version and method it validates there are the header's, not the body's,
+/// and a body-level `_meta.protocolVersion` or an unimplemented method only
+/// surfaces once `handle_message` itself parses the request. The spec ties
+/// each such JSON-RPC error to a specific transport status rather than
+/// leaving every error at 200, so this maps the two that can come back:
+/// method-not-found to 404 (streamable-http.mdx line 271-275) and an
+/// unsupported protocol version to 400 (same file, line 263-269). Anything
+/// else - including a normal result - keeps 200.
+fn status_for_message_response(response: &str) -> u16 {
+    let Ok(parsed) = serde_json::from_str::<Value>(response) else {
+        return 200;
+    };
+    match parsed.get("error").and_then(|error| error.get("code")) {
+        Some(code) if code == METHOD_NOT_FOUND => 404,
+        Some(code) if code == UNSUPPORTED_PROTOCOL_VERSION => 400,
+        _ => 200,
     }
 }
 
@@ -297,19 +320,94 @@ fn check_headers(request: &HttpRequest, message: &Value) -> Result<(), JsonRpcEr
                     "Missing Mcp-Name header",
                 ))
             }
-            Some(header) if header != body_name => {
-                return Err(JsonRpcError::new(
-                    HEADER_MISMATCH,
-                    format!(
-                        "Header mismatch: Mcp-Name header value '{header}' does not match body value '{body_name}'"
-                    ),
-                ))
+            Some(header) => {
+                let Ok(decoded) = decode_header_value(header) else {
+                    return Err(JsonRpcError::new(
+                        HEADER_MISMATCH,
+                        format!("Mcp-Name header value '{header}' is not valid base64/UTF-8"),
+                    ));
+                };
+                if decoded != body_name {
+                    return Err(JsonRpcError::new(
+                        HEADER_MISMATCH,
+                        format!(
+                            "Header mismatch: Mcp-Name header value '{header}' does not match body value '{body_name}'"
+                        ),
+                    ));
+                }
             }
-            Some(_) => {}
         }
     }
 
     Ok(())
+}
+
+/// Undoes the spec's `=?base64?...?=` sentinel a client uses to carry an
+/// `Mcp-Name` value that is not plain, header-safe ASCII (Value Encoding
+/// section of streamable-http.mdx). A value with no sentinel is returned
+/// unchanged, since a header-safe tool name is sent as-is. `Err` means the
+/// sentinel was present but the payload inside it was not valid
+/// base64-encoded UTF-8, which the caller treats as a header mismatch.
+fn decode_header_value(value: &str) -> Result<std::borrow::Cow<'_, str>, ()> {
+    let Some(inner) = value
+        .strip_prefix("=?base64?")
+        .and_then(|rest| rest.strip_suffix("?="))
+    else {
+        return Ok(std::borrow::Cow::Borrowed(value));
+    };
+    let bytes = decode_base64(inner).ok_or(())?;
+    String::from_utf8(bytes)
+        .map(std::borrow::Cow::Owned)
+        .map_err(|_| ())
+}
+
+/// A small hand-rolled RFC 4648 (standard alphabet, `+`/`/`, `=` padding)
+/// decoder rather than a new crate dependency, since this only ever has to
+/// decode one header value at a time.
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let input = input.as_bytes();
+    if input.is_empty() || input.len() % 4 != 0 {
+        return None;
+    }
+    let chunk_count = input.len() / 4;
+    let mut out = Vec::with_capacity(chunk_count * 3);
+    for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+        let is_last_chunk = chunk_index + 1 == chunk_count;
+        let mut values = [0u8; 4];
+        let mut padding = 0;
+        for (i, &byte) in chunk.iter().enumerate() {
+            // Padding is only meaningful in the last two positions of the
+            // final group; anywhere else it is not valid base64.
+            if byte == b'=' && is_last_chunk && i >= 2 {
+                padding += 1;
+            } else {
+                values[i] = sextet(byte)?;
+            }
+        }
+        let bits = (values[0] as u32) << 18
+            | (values[1] as u32) << 12
+            | (values[2] as u32) << 6
+            | (values[3] as u32);
+        out.push((bits >> 16) as u8);
+        if padding < 2 {
+            out.push((bits >> 8) as u8);
+        }
+        if padding == 0 {
+            out.push(bits as u8);
+        }
+    }
+    Some(out)
 }
 
 fn is_local_origin(origin: &str) -> bool {
@@ -411,6 +509,93 @@ mod tests {
 
         assert_eq!(response.status, 400);
         assert_eq!(body_json(&response)["error"]["code"], HEADER_MISMATCH);
+    }
+
+    /// The spec's own Value Encoding example: a non-ASCII tool name must be
+    /// sent Base64-wrapped, and the server must decode it before comparing.
+    #[test]
+    fn a_base64_wrapped_name_header_matches_a_non_ascii_tool_name() {
+        let server = memory_server();
+
+        let response = response_for(
+            &server,
+            &post(
+                vec![
+                    ("MCP-Protocol-Version", PROTOCOL_V2),
+                    ("Mcp-Method", "tools/call"),
+                    ("Mcp-Name", "=?base64?Y2Fmw6lfbG9va3Vw?="),
+                ],
+                tools_call_body("café_lookup"),
+            ),
+        );
+
+        // The tool itself does not exist, so this still fails - but as a
+        // normal "tool not found" result, not a header mismatch, proving the
+        // header was decoded and compared correctly before dispatch.
+        assert_eq!(response.status, 200, "{:?}", body_json(&response));
+        assert_ne!(body_json(&response)["error"]["code"], HEADER_MISMATCH);
+    }
+
+    #[test]
+    fn a_base64_wrapped_name_header_that_disagrees_with_the_body_is_still_a_mismatch() {
+        let server = memory_server();
+
+        let response = response_for(
+            &server,
+            &post(
+                vec![
+                    ("MCP-Protocol-Version", PROTOCOL_V2),
+                    ("Mcp-Method", "tools/call"),
+                    ("Mcp-Name", "=?base64?Y2Fmw6lfbG9va3Vw?="), // "café_lookup"
+                ],
+                tools_call_body("list_tables"),
+            ),
+        );
+
+        assert_eq!(response.status, 400);
+        assert_eq!(body_json(&response)["error"]["code"], HEADER_MISMATCH);
+    }
+
+    #[test]
+    fn an_invalid_base64_sentinel_is_a_header_mismatch_not_a_panic() {
+        let server = memory_server();
+
+        let response = response_for(
+            &server,
+            &post(
+                vec![
+                    ("MCP-Protocol-Version", PROTOCOL_V2),
+                    ("Mcp-Method", "tools/call"),
+                    ("Mcp-Name", "=?base64?not valid base64?="),
+                ],
+                tools_call_body("list_tables"),
+            ),
+        );
+
+        assert_eq!(response.status, 400);
+        assert_eq!(body_json(&response)["error"]["code"], HEADER_MISMATCH);
+    }
+
+    #[test]
+    fn decode_base64_matches_the_specs_own_encoding_examples() {
+        assert_eq!(
+            decode_header_value("=?base64?Y2Fmw6lfbG9va3Vw?=")
+                .unwrap()
+                .into_owned(),
+            "café_lookup"
+        );
+        assert_eq!(
+            decode_header_value("=?base64?SGVsbG8sIOS4lueVjA==?=")
+                .unwrap()
+                .into_owned(),
+            "Hello, 世界"
+        );
+        assert_eq!(
+            decode_header_value("us-west1").unwrap().into_owned(),
+            "us-west1",
+            "a value with no sentinel is passed through unchanged"
+        );
+        assert!(decode_header_value("=?base64?not valid base64?=").is_err());
     }
 
     #[test]
@@ -597,6 +782,65 @@ mod tests {
         assert_eq!(
             body["error"]["data"]["supportedVersions"],
             json!(SUPPORTED_VERSIONS)
+        );
+    }
+
+    /// streamable-http.mdx line 271-275: an unimplemented RPC method MUST come
+    /// back as 404, carrying the -32601 JSON-RPC error, not a 200.
+    #[test]
+    fn an_unimplemented_method_answers_404_not_200() {
+        let server = memory_server();
+
+        let response = response_for(
+            &server,
+            &post(
+                vec![
+                    ("MCP-Protocol-Version", PROTOCOL_V2),
+                    ("Mcp-Method", "resources/read"),
+                ],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "resources/read",
+                    "params": { "uri": "file:///x" },
+                }),
+            ),
+        );
+
+        assert_eq!(response.status, 404, "{:?}", body_json(&response));
+        assert_eq!(body_json(&response)["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    /// streamable-http.mdx line 263-269: the same paragraph requires 400 for
+    /// an unsupported protocol version. This is the body-level
+    /// `_meta.protocolVersion` check (`check_protocol_version` in
+    /// `mod.rs`), distinct from the header-level check above it - both must
+    /// map to 400, not just the header one.
+    #[test]
+    fn a_body_level_unsupported_protocol_version_answers_400_not_200() {
+        let server = memory_server();
+
+        let response = response_for(
+            &server,
+            &post(
+                vec![
+                    ("MCP-Protocol-Version", PROTOCOL_V2),
+                    ("Mcp-Method", "tools/list"),
+                ],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                    "_meta": { "io.modelcontextprotocol/protocolVersion": "1999-01-01" },
+                }),
+            ),
+        );
+
+        assert_eq!(response.status, 400, "{:?}", body_json(&response));
+        assert_eq!(
+            body_json(&response)["error"]["code"],
+            UNSUPPORTED_PROTOCOL_VERSION
         );
     }
 
