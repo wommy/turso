@@ -1,4 +1,7 @@
-use super::protocol::{CallToolRequest, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use super::protocol::{
+    result_meta, CallToolRequest, JsonRpcError, JsonRpcRequest, JsonRpcResponse, CACHE_TTL_MS,
+    INVALID_PARAMS,
+};
 use super::TursoMcpServer;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -116,10 +119,14 @@ fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, 
 
 impl TursoMcpServer {
     pub(crate) fn handle_list_tools(&self, request: JsonRpcRequest) -> JsonRpcResponse {
-        JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
+        JsonRpcResponse::success(
+            request.id,
+            json!({
+                "resultType": "complete",
+                // The catalog cannot change while the server runs.
+                "ttlMs": CACHE_TTL_MS,
+                "cacheScope": "public",
+                "_meta": result_meta(),
                 "tools": [
                     {
                         "name": "open_database",
@@ -238,9 +245,8 @@ impl TursoMcpServer {
                         }
                     }
                 ]
-            })),
-            error: None,
-        }
+            }),
+        )
     }
 
     pub(crate) fn handle_call_tool(&self, request: JsonRpcRequest) -> JsonRpcResponse {
@@ -285,30 +291,24 @@ impl TursoMcpServer {
             "delete_data" => self.delete_data(&tool_request.arguments),
             "schema_change" => self.schema_change(&tool_request.arguments),
             _ => {
-                return JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32601,
-                        message: format!("Unknown tool: {}", tool_request.name),
-                        data: None,
-                    }),
-                };
+                return JsonRpcResponse::failure(
+                    request.id,
+                    JsonRpcError::new(
+                        INVALID_PARAMS,
+                        format!("Unknown tool: {}", tool_request.name),
+                    ),
+                );
             }
         };
 
-        JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "content": [{
-                    "type": "text",
-                    "text": result
-                }]
-            })),
-            error: None,
-        }
+        JsonRpcResponse::success(
+            request.id,
+            json!({
+                "resultType": "complete",
+                "_meta": result_meta(),
+                "content": [{ "type": "text", "text": result }],
+            }),
+        )
     }
 
     fn open_database(&self, arguments: &Option<Value>) -> String {

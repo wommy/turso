@@ -1,5 +1,30 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
+
+/// The revision this server speaks natively. It has no handshake: every
+/// request carries its own version and client identity in `_meta`.
+pub(crate) const PROTOCOL_V2: &str = "2026-07-28";
+
+/// Newest first. `2025-03-26` is left out deliberately - it is the
+/// batch-request revision, and we never implemented batching.
+pub(crate) const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_V2, "2025-06-18", "2024-11-05"];
+
+/// Answer to a handshake asking for a version we do not know.
+pub(crate) const LEGACY_DEFAULT: &str = "2025-06-18";
+
+pub(crate) const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub(crate) const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+pub(crate) const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+pub(crate) const PARSE_ERROR: i32 = -32700;
+pub(crate) const INVALID_REQUEST: i32 = -32600;
+pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
+pub(crate) const INVALID_PARAMS: i32 = -32602;
+pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+
+/// The tool list cannot change while the server runs, so a client may hold it
+/// for as long as it likes.
+pub(crate) const CACHE_TTL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct JsonRpcRequest {
@@ -40,4 +65,100 @@ pub(crate) struct InitializeRequest {
 pub(crate) struct CallToolRequest {
     pub(crate) name: String,
     pub(crate) arguments: Option<Value>,
+}
+
+impl JsonRpcRequest {
+    /// `_meta` lives on `params`. Nowhere else: the schema puts it on
+    /// `RequestParams`, and all three official SDKs read and write it there in
+    /// every revision. A top-level `_meta` is a `Result` field, which has no
+    /// `params` to nest inside - a fact about responses that does not carry
+    /// over to requests.
+    fn meta(&self) -> Option<&Value> {
+        self.params.as_ref()?.get("_meta")
+    }
+
+    /// A client that names no version is pre-v2, and is served as one.
+    pub(crate) fn protocol_version(&self) -> Option<&str> {
+        self.meta()?.get(META_PROTOCOL_VERSION)?.as_str()
+    }
+
+    fn declares_v2(&self) -> bool {
+        self.protocol_version() == Some(PROTOCOL_V2)
+    }
+
+    pub(crate) fn check_protocol_version(&self) -> Result<(), JsonRpcError> {
+        let Some(version) = self.protocol_version() else {
+            return Ok(());
+        };
+        if SUPPORTED_VERSIONS.contains(&version) {
+            return Ok(());
+        }
+        Err(JsonRpcError {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: format!("Unsupported protocol version: {version}"),
+            data: Some(json!({ "supported": SUPPORTED_VERSIONS, "requested": version })),
+        })
+    }
+
+    /// v2 requires `clientCapabilities` on every request. We hold a client to
+    /// that only when it says it speaks v2 - a pre-v2 client has no such field
+    /// to send, and rejecting one over it would exclude every client that
+    /// exists today for a value this server never reads.
+    pub(crate) fn check_client_capabilities(&self) -> Result<(), JsonRpcError> {
+        if !self.declares_v2()
+            || self
+                .meta()
+                .is_some_and(|m| m.get(META_CLIENT_CAPABILITIES).is_some())
+        {
+            return Ok(());
+        }
+        Err(JsonRpcError::new(
+            INVALID_PARAMS,
+            format!(
+                "A {PROTOCOL_V2} request must carry params._meta[\"{META_CLIENT_CAPABILITIES}\"]"
+            ),
+        ))
+    }
+}
+
+impl JsonRpcResponse {
+    pub(crate) fn success(id: Option<Value>, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub(crate) fn failure(id: Option<Value>, error: JsonRpcError) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
+
+impl JsonRpcError {
+    pub(crate) fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+pub(crate) fn server_info() -> Value {
+    json!({ "name": "turso-mcp", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// v2 results name the server in `_meta`. Pre-v2 clients ignore the field, so
+/// it is always sent rather than branched on.
+pub(crate) fn result_meta() -> Value {
+    let mut meta = Map::new();
+    meta.insert(META_SERVER_INFO.to_string(), server_info());
+    Value::Object(meta)
 }

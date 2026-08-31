@@ -1,4 +1,3 @@
-use super::protocol::JsonRpcRequest;
 use super::TursoMcpServer;
 use anyhow::Result;
 use std::io::{self, BufRead, BufReader, Write};
@@ -49,19 +48,10 @@ impl TursoMcpServer {
                         continue;
                     }
 
-                    let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                        Ok(req) => req,
-                        Err(e) => {
-                            eprintln!("Failed to parse JSON-RPC request: {e}");
-                            continue;
-                        }
-                    };
-
-                    let response = self.handle_request(request);
-                    // Don't send a response for notifications (when id is None)
-                    if response.id.is_some() || response.error.is_some() {
-                        let response_json = serde_json::to_string(&response)?;
-                        writeln!(stdout_lock, "{response_json}")?;
+                    // A notification answers with nothing, so there is no
+                    // response to inspect and discard here.
+                    if let Some(response) = self.handle_message(&line) {
+                        writeln!(stdout_lock, "{response}")?;
                         stdout_lock.flush()?;
                     }
                 }
