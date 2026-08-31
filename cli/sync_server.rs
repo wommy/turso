@@ -114,40 +114,7 @@ impl TursoSyncServer {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-        let mut buffer = [0u8; 8192];
-        let mut request_data = Vec::new();
-
-        loop {
-            let n = stream.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            // Bytes before this offset hold no terminator, and one can still
-            // straddle the last three of them.
-            let unscanned = request_data.len().saturating_sub(3);
-            request_data.extend_from_slice(&buffer[..n]);
-
-            let Some(header_end) = find_header_end(&request_data, unscanned) else {
-                if request_data.len() > MAX_HEADER_BYTES {
-                    return Err(anyhow!(
-                        "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
-                    ));
-                }
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request_data[..header_end]);
-            if let Some(content_length) = parse_content_length(&headers) {
-                let total_expected = request_end(header_end, content_length)?;
-                while request_data.len() < total_expected {
-                    let n = stream.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    request_data.extend_from_slice(&buffer[..n]);
-                }
-            }
-            break;
-        }
+        let request_data = read_http_request(&mut stream)?;
 
         let (method, path, body) = parse_http_request(&request_data)?;
         info!("Request: {} {}", method, path);
@@ -1148,6 +1115,45 @@ fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
     (header_end + 4)
         .checked_add(content_length)
         .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut buffer = [0u8; 8192];
+    let mut request_data = Vec::new();
+
+    loop {
+        let n = stream.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        // Bytes before this offset hold no terminator, and one can still
+        // straddle the last three of them.
+        let unscanned = request_data.len().saturating_sub(3);
+        request_data.extend_from_slice(&buffer[..n]);
+
+        let Some(header_end) = find_header_end(&request_data, unscanned) else {
+            if request_data.len() > MAX_HEADER_BYTES {
+                return Err(anyhow!(
+                    "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
+                ));
+            }
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request_data[..header_end]);
+        if let Some(content_length) = parse_content_length(&headers) {
+            let total_expected = request_end(header_end, content_length)?;
+            while request_data.len() < total_expected {
+                let n = stream.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                request_data.extend_from_slice(&buffer[..n]);
+            }
+        }
+        break;
+    }
+
+    Ok(request_data)
 }
 
 fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
