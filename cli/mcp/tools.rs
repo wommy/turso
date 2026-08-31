@@ -117,6 +117,36 @@ fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, 
     Ok(sql)
 }
 
+/// What a tool produces when it succeeds: prose for a person reading the
+/// client UI, and the same answer typed for a model.
+#[derive(Debug)]
+pub(crate) struct ToolOutput {
+    text: String,
+    structured: Value,
+}
+
+impl ToolOutput {
+    fn new(text: impl Into<String>, structured: Value) -> Self {
+        Self {
+            text: text.into(),
+            structured,
+        }
+    }
+}
+
+/// SQL values carry types that JSON can mostly hold. Blobs are the exception:
+/// they are tagged rather than inlined, so a model cannot mistake one for text
+/// it can act on.
+fn sql_value_to_json(value: &DbValue) -> Value {
+    match value {
+        DbValue::Null => Value::Null,
+        DbValue::Numeric(Numeric::Integer(n)) => json!(n),
+        DbValue::Numeric(Numeric::Float(f)) => json!(f64::from(*f)),
+        DbValue::Text(text) => json!(text.to_string()),
+        DbValue::Blob(_) => json!({ "blob": value.to_string() }),
+    }
+}
+
 impl TursoMcpServer {
     pub(crate) fn handle_list_tools(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         JsonRpcResponse::success(
@@ -130,6 +160,15 @@ impl TursoMcpServer {
                 "tools": [
                     {
                         "name": "open_database",
+                        "title": "Open a database file",
+                        "annotations": {
+                            "title": "Open a database file",
+                            "readOnlyHint": false,
+                            "destructiveHint": false,
+                            "idempotentHint": false,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] },
                         "description": "Open or create a database file. Creates parent directories if needed.",
                         "inputSchema": {
                             "type": "object",
@@ -144,6 +183,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "current_database",
+                        "title": "Show the open database",
+                        "annotations": {
+                            "title": "Show the open database",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] },
                         "description": "Get the path of the currently open database",
                         "inputSchema": {
                             "type": "object",
@@ -153,6 +201,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "list_tables",
+                        "title": "List tables",
+                        "annotations": {
+                            "title": "List tables",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "tables": { "type": "array", "items": { "type": "string" } } }, "required": ["tables"] },
                         "description": "List all tables in the database",
                         "inputSchema": {
                             "type": "object",
@@ -162,6 +219,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "describe_table",
+                        "title": "Describe a table",
+                        "annotations": {
+                            "title": "Describe a table",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "table": { "type": "string" }, "columns": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string" }, "nullable": { "type": "boolean" }, "default": {}, "primary_key": { "type": "boolean" }, "generated": { "type": "boolean" } } } } }, "required": ["table", "columns"] },
                         "description": "Describe the structure of a specific table",
                         "inputSchema": {
                             "type": "object",
@@ -176,6 +242,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "execute_query",
+                        "title": "Run a SELECT query",
+                        "annotations": {
+                            "title": "Run a SELECT query",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
                         "description": "Execute a read-only SELECT query",
                         "inputSchema": {
                             "type": "object",
@@ -190,6 +265,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "insert_data",
+                        "title": "Insert rows",
+                        "annotations": {
+                            "title": "Insert rows",
+                            "readOnlyHint": false,
+                            "destructiveHint": false,
+                            "idempotentHint": false,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "changes": { "type": "integer" } }, "required": ["changes"] },
                         "description": "Insert new data into a table",
                         "inputSchema": {
                             "type": "object",
@@ -204,6 +288,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "update_data",
+                        "title": "Update rows",
+                        "annotations": {
+                            "title": "Update rows",
+                            "readOnlyHint": false,
+                            "destructiveHint": true,
+                            "idempotentHint": false,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "changes": { "type": "integer" } }, "required": ["changes"] },
                         "description": "Update existing data in a table",
                         "inputSchema": {
                             "type": "object",
@@ -218,6 +311,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "delete_data",
+                        "title": "Delete rows",
+                        "annotations": {
+                            "title": "Delete rows",
+                            "readOnlyHint": false,
+                            "destructiveHint": true,
+                            "idempotentHint": false,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "changes": { "type": "integer" } }, "required": ["changes"] },
                         "description": "Delete data from a table",
                         "inputSchema": {
                             "type": "object",
@@ -232,6 +334,15 @@ impl TursoMcpServer {
                     },
                     {
                         "name": "schema_change",
+                        "title": "Change the schema",
+                        "annotations": {
+                            "title": "Change the schema",
+                            "readOnlyHint": false,
+                            "destructiveHint": true,
+                            "idempotentHint": false,
+                            "openWorldHint": false
+                        },
+                        "outputSchema": { "type": "object", "properties": { "changes": { "type": "integer" } }, "required": ["changes"] },
                         "description": "Execute schema modification statements (CREATE TABLE, ALTER TABLE, DROP TABLE)",
                         "inputSchema": {
                             "type": "object",
@@ -301,292 +412,284 @@ impl TursoMcpServer {
             }
         };
 
-        JsonRpcResponse::success(
-            request.id,
-            json!({
-                "resultType": "complete",
-                "_meta": result_meta(),
-                "content": [{ "type": "text", "text": result }],
-            }),
-        )
+        // A tool that fails says so in the result. Before this, a rejected
+        // multi-statement UPDATE and a successful one were both successful
+        // results whose text happened to differ, which a model cannot tell
+        // apart.
+        let (text, structured, is_error) = match result {
+            Ok(output) => (output.text, Some(output.structured), false),
+            Err(message) => (message, None, true),
+        };
+        let mut payload = json!({
+            "resultType": "complete",
+            "_meta": result_meta(),
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        });
+        if let Some(structured) = structured {
+            payload["structuredContent"] = structured;
+        }
+        JsonRpcResponse::success(request.id, payload)
     }
 
-    fn open_database(&self, arguments: &Option<Value>) -> String {
-        let path = match arguments {
-            Some(args) => match args.get("path") {
-                Some(Value::String(p)) => p.clone(),
-                _ => return "Missing or invalid path parameter".to_string(),
-            },
-            None => return "Missing path parameter".to_string(),
-        };
+    fn open_database(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let path = arguments
+            .as_ref()
+            .and_then(|args| args.get("path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Missing or invalid path parameter".to_string())?
+            .to_string();
 
-        // Create parent directories if needed
         if path != ":memory:" {
-            let db_path = PathBuf::from(&path);
-            if let Some(parent) = db_path.parent() {
+            if let Some(parent) = PathBuf::from(&path).parent() {
                 if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        return format!("Failed to create parent directories: {e}");
-                    }
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create parent directories: {e}"))?;
                 }
             }
         }
 
-        // Open the new database connection
         let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
-            match Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect)) {
-                Ok((_io, c)) => c,
-                Err(e) => return format!("Failed to open database '{path}': {e}"),
-            }
+            Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect))
+                .map_err(|e| format!("Failed to open database '{path}': {e}"))?
+                .1
         } else {
-            match Database::open_new(
+            let (_io, db) = Database::open_new(
                 &path,
                 None::<&str>,
                 OpenFlags::default(),
                 DatabaseOpts::new().with_autovacuum(false),
                 None,
                 Arc::new(SqliteDialect),
-            ) {
-                Ok((_io, db)) => match db.connect() {
-                    Ok(c) => c,
-                    Err(e) => return format!("Failed to connect to database '{path}': {e}"),
-                },
-                Err(e) => return format!("Failed to open database '{path}': {e}"),
-            }
+            )
+            .map_err(|e| format!("Failed to open database '{path}': {e}"))?;
+            db.connect()
+                .map_err(|e| format!("Failed to connect to database '{path}': {e}"))?
         };
 
-        // Update the connection and path
         *self.conn.lock().unwrap() = conn;
         *self.current_db_path.lock().unwrap() = Some(path.clone());
 
-        format!("Successfully opened database: {path}")
+        Ok(ToolOutput::new(
+            format!("Successfully opened database: {path}"),
+            json!({ "path": path }),
+        ))
     }
 
-    fn current_database(&self) -> String {
-        match &*self.current_db_path.lock().unwrap() {
-            Some(path) => format!("Current database: {path}"),
-            None => "Current database: :memory: (default)".to_string(),
-        }
+    fn current_database(&self) -> Result<ToolOutput, String> {
+        let path = self
+            .current_db_path
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| ":memory:".to_string());
+        Ok(ToolOutput::new(
+            format!("Current database: {path}"),
+            json!({ "path": path }),
+        ))
     }
 
-    fn list_tables(&self) -> String {
+    fn list_tables(&self) -> Result<ToolOutput, String> {
         let query = "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1";
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.query(query) {
-            Ok(Some(mut rows)) => {
-                let mut tables = Vec::new();
+        let mut rows = conn
+            .query(query)
+            .map_err(|e| format!("Error querying database: {e}"))?
+            .ok_or_else(|| "No results returned from the query".to_string())?;
 
-                let res = rows.run_with_row_callback(|row| {
-                    if let Ok(DbValue::Text(table)) = row.get::<&DbValue>(0) {
-                        tables.push(table.to_string());
-                    }
-                    Ok(())
-                });
-                if let Err(err) = res {
-                    return err.to_string();
-                }
-
-                if tables.is_empty() {
-                    "No tables found in the database".to_string()
-                } else {
-                    tables.join(", ")
-                }
+        let mut tables = Vec::new();
+        rows.run_with_row_callback(|row| {
+            if let Ok(DbValue::Text(table)) = row.get::<&DbValue>(0) {
+                tables.push(table.to_string());
             }
-            Ok(None) => "No results returned from the query".to_string(),
-            Err(e) => format!("Error querying database: {e}"),
-        }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+
+        let text = if tables.is_empty() {
+            "No tables found in the database".to_string()
+        } else {
+            tables.join(", ")
+        };
+        Ok(ToolOutput::new(text, json!({ "tables": tables })))
     }
 
-    fn describe_table(&self, arguments: &Option<Value>) -> String {
-        let table_name = match arguments {
-            Some(args) => match args.get("table_name") {
-                Some(Value::String(name)) => name,
-                _ => return "Missing or invalid table_name parameter".to_string(),
-            },
-            None => return "Missing table_name parameter".to_string(),
-        };
+    fn describe_table(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let table_name = arguments
+            .as_ref()
+            .and_then(|args| args.get("table_name"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Missing or invalid table_name parameter".to_string())?;
 
-        // Use table_xinfo to include generated columns (table_info hides them)
+        // table_xinfo rather than table_info: the latter hides generated columns.
         let query = format!("PRAGMA table_xinfo({table_name})");
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.query(&query) {
-            Ok(Some(mut rows)) => {
-                let mut columns = Vec::new();
-                let res = rows.run_with_row_callback(|row| {
-                    if let (
-                        Ok(col_name),
-                        Ok(col_type),
-                        Ok(not_null),
-                        Ok(default_value),
-                        Ok(pk),
-                        Ok(hidden),
-                    ) = (
-                        row.get::<&DbValue>(1),
-                        row.get::<&DbValue>(2),
-                        row.get::<&DbValue>(3),
-                        row.get::<&DbValue>(4),
-                        row.get::<&DbValue>(5),
-                        row.get::<&DbValue>(6),
-                    ) {
-                        let default_str = if matches!(default_value, DbValue::Null) {
-                            "".to_string()
-                        } else {
-                            format!("DEFAULT {default_value}")
-                        };
+        let mut rows = conn
+            .query(&query)
+            .map_err(|e| format!("Error querying database: {e}"))?
+            .ok_or_else(|| format!("Table '{table_name}' not found"))?;
 
-                        let generated_str = match hidden {
-                            DbValue::Numeric(Numeric::Integer(2)) => " VIRTUAL GENERATED",
-                            _ => "",
-                        };
+        let mut described: Vec<Value> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+        rows.run_with_row_callback(|row| {
+            let (Ok(name), Ok(kind), Ok(not_null), Ok(default_value), Ok(pk), Ok(hidden)) = (
+                row.get::<&DbValue>(1),
+                row.get::<&DbValue>(2),
+                row.get::<&DbValue>(3),
+                row.get::<&DbValue>(4),
+                row.get::<&DbValue>(5),
+                row.get::<&DbValue>(6),
+            ) else {
+                return Ok(());
+            };
 
-                        columns.push(
-                            format!(
-                                "{} {} {} {} {}{}",
-                                col_name,
-                                col_type,
-                                if matches!(not_null, DbValue::Numeric(Numeric::Integer(1))) {
-                                    "NOT NULL"
-                                } else {
-                                    "NULL"
-                                },
-                                default_str,
-                                if matches!(pk, DbValue::Numeric(Numeric::Integer(1))) {
-                                    "PRIMARY KEY"
-                                } else {
-                                    ""
-                                },
-                                generated_str
-                            )
-                            .trim()
-                            .to_string(),
-                        );
-                    }
-                    Ok(())
-                });
+            let nullable = !matches!(not_null, DbValue::Numeric(Numeric::Integer(1)));
+            let primary_key = matches!(pk, DbValue::Numeric(Numeric::Integer(1)));
+            let generated = matches!(hidden, DbValue::Numeric(Numeric::Integer(2)));
+            let default = match default_value {
+                DbValue::Null => Value::Null,
+                other => json!(other.to_string()),
+            };
 
-                if let Err(err) = res {
-                    return err.to_string();
-                }
-                if columns.is_empty() {
-                    format!("Table '{table_name}' not found")
-                } else {
-                    format!("Table '{table_name}' columns:\n{}", columns.join("\n"))
-                }
-            }
-            Ok(None) => format!("Table '{table_name}' not found"),
-            Err(e) => format!("Error querying database: {e}"),
+            described.push(json!({
+                "name": name.to_string(),
+                "type": kind.to_string(),
+                "nullable": nullable,
+                "default": default,
+                "primary_key": primary_key,
+                "generated": generated,
+            }));
+
+            let default_str = match default_value {
+                DbValue::Null => String::new(),
+                other => format!("DEFAULT {other}"),
+            };
+            lines.push(
+                format!(
+                    "{} {} {} {} {}{}",
+                    name,
+                    kind,
+                    if nullable { "NULL" } else { "NOT NULL" },
+                    default_str,
+                    if primary_key { "PRIMARY KEY" } else { "" },
+                    if generated { " VIRTUAL GENERATED" } else { "" }
+                )
+                .trim()
+                .to_string(),
+            );
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+
+        if described.is_empty() {
+            return Err(format!("Table '{table_name}' not found"));
         }
+        Ok(ToolOutput::new(
+            format!("Table '{table_name}' columns:\n{}", lines.join("\n")),
+            json!({ "table": table_name, "columns": described }),
+        ))
     }
 
-    fn execute_query(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Select) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn execute_query(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let query = validated_query(arguments, StmtClass::Select)?;
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.query(query) {
-            Ok(Some(mut rows)) => {
-                let mut results = Vec::new();
+        let mut rows = conn
+            .query(query)
+            .map_err(|e| format!("Error executing query: {e}"))?
+            .ok_or_else(|| "No results returned from the query".to_string())?;
 
-                // Get column names
-                let headers: Vec<String> = (0..rows.num_columns())
-                    .map(|i| rows.get_column_name(i).to_string())
-                    .collect();
+        let columns: Vec<String> = (0..rows.num_columns())
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
 
-                // Get the data
-                let res = rows.run_with_row_callback(|row| {
-                    let mut row_data = Vec::new();
+        let mut typed: Vec<Value> = Vec::new();
+        let mut rendered: Vec<Vec<String>> = Vec::new();
+        rows.run_with_row_callback(|row| {
+            let values: Vec<&DbValue> = row.get_values().collect();
+            typed.push(Value::Array(
+                values.iter().map(|v| sql_value_to_json(v)).collect(),
+            ));
+            rendered.push(values.iter().map(|v| v.to_string()).collect());
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
 
-                    for value in row.get_values() {
-                        row_data.push(value.to_string());
-                    }
-
-                    results.push(row_data);
-                    Ok(())
-                });
-
-                if let Err(err) = res {
-                    return err.to_string();
-                }
-
-                // Format results as text table
-                let mut output = String::new();
-                if !headers.is_empty() {
-                    output.push_str(&headers.join(" | "));
-                    output.push('\n');
-                    output.push_str(&"-".repeat(headers.join(" | ").len()));
-                    output.push('\n');
-                }
-
-                for row in results {
-                    output.push_str(&row.join(" | "));
-                    output.push('\n');
-                }
-
-                if output.is_empty() {
-                    "No results returned from the query".to_string()
-                } else {
-                    output
-                }
-            }
-            Ok(None) => "No results returned from the query".to_string(),
-            Err(e) => format!("Error executing query: {e}"),
+        let mut text = String::new();
+        if !columns.is_empty() {
+            let header = columns.join(" | ");
+            text.push_str(&header);
+            text.push('\n');
+            text.push_str(&"-".repeat(header.len()));
+            text.push('\n');
         }
+        for row in &rendered {
+            text.push_str(&row.join(" | "));
+            text.push('\n');
+        }
+        if text.is_empty() {
+            text = "No results returned from the query".to_string();
+        }
+
+        let row_count = typed.len();
+        Ok(ToolOutput::new(
+            text,
+            json!({ "columns": columns, "rows": typed, "row_count": row_count }),
+        ))
     }
 
-    fn insert_data(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Insert) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn insert_data(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let query = validated_query(arguments, StmtClass::Insert)?;
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.execute(query) {
-            Ok(()) => "INSERT successful.".to_string(),
-            Err(e) => format!("Error executing INSERT: {e}"),
-        }
+        conn.execute(query)
+            .map_err(|e| format!("Error executing INSERT: {e}"))?;
+        let changes = conn.changes();
+        Ok(ToolOutput::new(
+            format!("INSERT successful. {changes} row(s) changed."),
+            json!({ "changes": changes }),
+        ))
     }
 
-    fn update_data(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Update) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn update_data(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let query = validated_query(arguments, StmtClass::Update)?;
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.execute(query) {
-            Ok(()) => "UPDATE successful.".to_string(),
-            Err(e) => format!("Error executing UPDATE: {e}"),
-        }
+        conn.execute(query)
+            .map_err(|e| format!("Error executing UPDATE: {e}"))?;
+        let changes = conn.changes();
+        Ok(ToolOutput::new(
+            format!("UPDATE successful. {changes} row(s) changed."),
+            json!({ "changes": changes }),
+        ))
     }
 
-    fn delete_data(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Delete) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn delete_data(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let query = validated_query(arguments, StmtClass::Delete)?;
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.execute(query) {
-            Ok(()) => "DELETE successful.".to_string(),
-            Err(e) => format!("Error executing DELETE: {e}"),
-        }
+        conn.execute(query)
+            .map_err(|e| format!("Error executing DELETE: {e}"))?;
+        let changes = conn.changes();
+        Ok(ToolOutput::new(
+            format!("DELETE successful. {changes} row(s) changed."),
+            json!({ "changes": changes }),
+        ))
     }
 
-    fn schema_change(&self, arguments: &Option<Value>) -> String {
-        let query = match validated_query(arguments, StmtClass::Schema) {
-            Ok(q) => q,
-            Err(e) => return e,
-        };
+    fn schema_change(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        let query = validated_query(arguments, StmtClass::Schema)?;
 
         let conn = self.conn.lock().unwrap().clone();
-        match conn.execute(query) {
-            Ok(()) => "Schema change successful.".to_string(),
-            Err(e) => format!("Error executing schema change: {e}"),
-        }
+        conn.execute(query)
+            .map_err(|e| format!("Error executing schema change: {e}"))?;
+        let changes = conn.changes();
+        Ok(ToolOutput::new(
+            format!("Schema change successful. {changes} row(s) changed."),
+            json!({ "changes": changes }),
+        ))
     }
 }
 
@@ -621,9 +724,12 @@ mod tests {
     }
 
     fn orders_dump(server: &TursoMcpServer) -> String {
-        server.execute_query(&query_arg(
-            "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
-        ))
+        server
+            .execute_query(&query_arg(
+                "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
+            ))
+            .expect("dumping the table succeeds")
+            .text
     }
 
     #[test]
@@ -635,9 +741,10 @@ mod tests {
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         ));
 
+        let error = result.expect_err("a multi-statement call must be rejected");
         assert!(
-            result.contains("Only a single UPDATE statement is allowed"),
-            "expected single-statement rejection, got: {result}"
+            error.contains("Only a single UPDATE statement is allowed"),
+            "got: {error}"
         );
 
         let dump = orders_dump(&server);
@@ -659,7 +766,8 @@ mod tests {
         let result = server.update_data(&query_arg(
             "UPDATE bench_orders SET status='DONE; DELETE' WHERE order_id=1",
         ));
-        assert_eq!(result, "UPDATE successful.");
+        let text = result.expect("a single UPDATE succeeds").text;
+        assert!(text.starts_with("UPDATE successful."), "{text}");
 
         let dump = orders_dump(&server);
         assert!(dump.contains("1 | DONE; DELETE | 1"), "{dump}");
@@ -675,9 +783,10 @@ mod tests {
             "INSERT INTO bench_orders VALUES (3, 'NEW', 3); DELETE FROM bench_orders WHERE order_id=2",
         ));
 
+        let error = result.expect_err("a multi-statement call must be rejected");
         assert!(
-            result.contains("Only a single INSERT statement is allowed"),
-            "expected single-statement rejection, got: {result}"
+            error.contains("Only a single INSERT statement is allowed"),
+            "got: {error}"
         );
         assert!(!orders_dump(&server).contains("3 | NEW | 3"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
@@ -692,9 +801,10 @@ mod tests {
             "DELETE FROM bench_orders WHERE order_id=1; DROP TABLE bench_orders",
         ));
 
+        let error = result.expect_err("a multi-statement call must be rejected");
         assert!(
-            result.contains("Only a single DELETE statement is allowed"),
-            "expected single-statement rejection, got: {result}"
+            error.contains("Only a single DELETE statement is allowed"),
+            "got: {error}"
         );
         let dump = orders_dump(&server);
         assert!(dump.contains("1 | READY | 1"), "{dump}");
@@ -710,9 +820,10 @@ mod tests {
             "CREATE TABLE extra (id INTEGER); DELETE FROM bench_orders",
         ));
 
+        let error = result.expect_err("a multi-statement call must be rejected");
         assert!(
-            result.contains("Only a single schema modification statement is allowed"),
-            "expected single-statement rejection, got: {result}"
+            error.contains("Only a single schema modification statement is allowed"),
+            "got: {error}"
         );
         assert!(orders_dump(&server).contains("1 | READY | 1"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
@@ -727,9 +838,10 @@ mod tests {
             "SELECT order_id FROM bench_orders WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         ));
 
+        let error = result.expect_err("a multi-statement call must be rejected");
         assert!(
-            result.contains("Only a single SELECT query is allowed"),
-            "expected single-statement rejection, got: {result}"
+            error.contains("Only a single SELECT query is allowed"),
+            "got: {error}"
         );
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
     }
@@ -742,8 +854,120 @@ mod tests {
         let result = server.update_data(&query_arg(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1",
         ));
-        assert_eq!(result, "UPDATE successful.");
+        let text = result.expect("a single UPDATE succeeds").text;
+        assert!(text.starts_with("UPDATE successful."), "{text}");
         assert!(orders_dump(&server).contains("1 | DONE | 1"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
+    }
+    fn call(server: &TursoMcpServer, name: &str, arguments: Value) -> Value {
+        let raw = server
+            .handle_message(
+                &json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments },
+                })
+                .to_string(),
+            )
+            .expect("a tools/call is answered");
+        serde_json::from_str::<Value>(&raw).expect("the answer is JSON")["result"].clone()
+    }
+
+    /// The point of the whole contract: a rejected call and a successful one
+    /// were previously both successful results whose text merely differed.
+    #[test]
+    fn a_rejected_call_is_marked_as_an_error_and_a_successful_one_is_not() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let rejected = call(
+            &server,
+            "update_data",
+            json!({ "query": "UPDATE bench_orders SET status='X'; DROP TABLE bench_orders" }),
+        );
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        assert!(
+            rejected["structuredContent"].is_null(),
+            "a failure carries no structured answer: {rejected}"
+        );
+
+        let accepted = call(
+            &server,
+            "update_data",
+            json!({ "query": "UPDATE bench_orders SET status='DONE' WHERE order_id=1" }),
+        );
+        assert_eq!(accepted["isError"], false, "{accepted}");
+        assert_eq!(accepted["structuredContent"]["changes"], 1);
+    }
+
+    /// Rows arrive typed, not as an ASCII table a model has to parse back.
+    #[test]
+    fn query_results_are_typed_and_match_the_declared_output_schema() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = call(
+            &server,
+            "execute_query",
+            json!({ "query": "SELECT order_id, status FROM bench_orders ORDER BY order_id" }),
+        );
+        let structured = &result["structuredContent"];
+
+        assert_eq!(structured["columns"], json!(["order_id", "status"]));
+        assert_eq!(structured["row_count"], 2);
+        assert_eq!(structured["rows"][0][0], 1, "an integer stays a number");
+        assert_eq!(structured["rows"][0][1], "READY", "text stays a string");
+        assert!(
+            result["content"][0]["text"].as_str().unwrap().contains('|'),
+            "the human-readable table is still there for a person"
+        );
+    }
+
+    /// A client should be able to tell a read from a destructive write without
+    /// calling either one.
+    #[test]
+    fn the_catalog_marks_reads_and_destructive_writes_apart() {
+        let server = memory_server();
+        let raw = server
+            .handle_message(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} })
+                    .to_string(),
+            )
+            .expect("tools/list is answered");
+        let listed = serde_json::from_str::<Value>(&raw).unwrap();
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is missing from the catalog"))
+                .clone()
+        };
+
+        let read = find("execute_query");
+        assert_eq!(read["annotations"]["readOnlyHint"], true);
+        assert_eq!(read["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            read["annotations"]["idempotentHint"], true,
+            "running the same read twice changes nothing"
+        );
+        assert!(read["outputSchema"]["properties"]["rows"].is_object());
+
+        let destructive = find("delete_data");
+        assert_eq!(destructive["annotations"]["readOnlyHint"], false);
+        assert_eq!(destructive["annotations"]["destructiveHint"], true);
+        assert_eq!(
+            destructive["annotations"]["idempotentHint"], false,
+            "a second identical write is not a no-op"
+        );
+
+        for tool in &tools {
+            assert!(
+                tool["outputSchema"].is_object(),
+                "{} has no outputSchema",
+                tool["name"]
+            );
+            assert_eq!(tool["annotations"]["openWorldHint"], false);
+        }
     }
 }
