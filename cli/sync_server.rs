@@ -1,10 +1,11 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -12,6 +13,10 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
+use crate::http::{
+    cors_headers, format_http_response, read_http_request, HttpRequest, HttpResponse, ReadLimits,
+    RequestError,
+};
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
@@ -20,6 +25,26 @@ use turso_sync_engine::server_proto::{
     PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
     PullUpdatesStreamKind, Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
+
+/// How long one request may take to arrive. The old code set this straight on
+/// the socket; it now travels with the read limits so the read loop can act on
+/// it rather than fail the connection outright.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total time a response may take to leave the socket, mirroring
+/// `cli/mcp/http.rs`'s `write_response_bounded`: a plain `write_all` is only
+/// bounded per individual write() call, so a client that drains a few bytes
+/// right before each write's own timeout keeps every write nominally
+/// succeeding while the response never finishes - and because this server
+/// handles one connection at a time (see `run`'s accept loop), that stalled
+/// write would block every other client too, the same way an unbounded read
+/// would. The budget is longer than the MCP server's because a pull-updates
+/// response can carry a whole database's worth of pages.
+const WRITE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a single write may block before the loop above rechecks the
+/// deadline and the shutdown signal.
+const WRITE_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
@@ -37,7 +62,6 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
-const MAX_HEADER_BYTES: usize = 32 * 1024;
 
 pub struct TursoSyncServer {
     address: String,
@@ -112,52 +136,36 @@ impl TursoSyncServer {
 
     fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-        let mut buffer = [0u8; 8192];
-        let mut request_data = Vec::new();
+        // The sync SDK is a trusted client, so it keeps the old unlimited body
+        // size, but not unlimited time: this server handles one connection at
+        // a time, so a client that connects and sends nothing would otherwise
+        // stop it serving anyone else. A malformed request (e.g. chunked,
+        // which this parser does not support) still gets a real response
+        // instead of a dropped socket.
+        let limits = ReadLimits::any_size(REQUEST_READ_TIMEOUT);
+        let response = match read_http_request(&mut stream, &limits) {
+            Ok(request) => self.route(request),
+            Err(RequestError::Refused(reason)) => HttpResponse::text(400, &reason),
+            Err(RequestError::Io(e)) => return Err(e),
+        };
 
-        loop {
-            let n = stream.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            // Bytes before this offset hold no terminator, and one can still
-            // straddle the last three of them.
-            let unscanned = request_data.len().saturating_sub(3);
-            request_data.extend_from_slice(&buffer[..n]);
+        let http_response = response.with_headers(cors_headers());
+        let response_bytes = format_http_response(&http_response);
+        write_response_bounded(
+            &self.interrupt_count,
+            &mut stream,
+            &response_bytes,
+            WRITE_DEADLINE,
+        )
+    }
 
-            let Some(header_end) = find_header_end(&request_data, unscanned) else {
-                if request_data.len() > MAX_HEADER_BYTES {
-                    return Err(anyhow!(
-                        "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
-                    ));
-                }
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request_data[..header_end]);
-            if let Some(content_length) = parse_content_length(&headers) {
-                let total_expected = request_end(header_end, content_length)?;
-                while request_data.len() < total_expected {
-                    let n = stream.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    request_data.extend_from_slice(&buffer[..n]);
-                }
-            }
-            break;
-        }
-
-        let (method, path, body) = parse_http_request(&request_data)?;
+    fn route(&self, request: HttpRequest) -> HttpResponse {
+        let (method, path, body) = (request.method, request.path, request.body);
         info!("Request: {} {}", method, path);
 
         let response = match (method.as_str(), path.as_str()) {
-            ("OPTIONS", _) => Ok(HttpResponse {
-                status: 204,
-                content_type: "text/plain".to_string(),
-                body: Vec::new(),
-            }),
+            ("OPTIONS", _) => Ok(HttpResponse::new(204, "text/plain", Vec::new())),
             ("POST", "/v2/pipeline") => {
                 debug!("Handling /v2/pipeline request");
                 self.handle_pipeline(&body)
@@ -168,31 +176,21 @@ impl TursoSyncServer {
             }
             _ => {
                 info!("Unknown endpoint: {} {}", method, path);
-                Ok(HttpResponse {
-                    status: 404,
-                    content_type: "text/plain".to_string(),
-                    body: b"Not Found".to_vec(),
-                })
+                Ok(HttpResponse::new(404, "text/plain", b"Not Found".to_vec()))
             }
         };
 
-        let http_response = match response {
+        match response {
             Ok(resp) => resp,
             Err(e) => {
                 error!("Request error: {}", e);
-                HttpResponse {
-                    status: 500,
-                    content_type: "text/plain".to_string(),
-                    body: format!("Internal Server Error: {e}").into_bytes(),
-                }
+                HttpResponse::new(
+                    500,
+                    "text/plain",
+                    format!("Internal Server Error: {e}").into_bytes(),
+                )
             }
-        };
-
-        let response_bytes = format_http_response(&http_response);
-        stream.write_all(&response_bytes)?;
-        stream.flush()?;
-
-        Ok(())
+        }
     }
 
     fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {
@@ -227,11 +225,7 @@ impl TursoSyncServer {
 
         let body = serde_json::to_vec(&resp)?;
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/json".to_string(),
-            body,
-        })
+        Ok(HttpResponse::new(200, "application/json", body))
     }
 
     fn execute_statement(&self, conn: &Arc<Connection>, req: &ExecuteStreamReq) -> StreamResult {
@@ -636,11 +630,11 @@ impl TursoSyncServer {
             response_body.len()
         );
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     fn handle_logical_pull_updates(&self, req: &PullUpdatesReqProtoBody) -> Result<HttpResponse> {
@@ -756,11 +750,11 @@ impl TursoSyncServer {
             body.len()
         );
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     fn handle_logical_fallback(
@@ -800,11 +794,11 @@ impl TursoSyncServer {
         let header_bytes = header.encode_to_vec();
         encode_length_delimited(&mut response_body, &header_bytes);
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     fn handle_replace_base_pages(&self, server_revision: String) -> Result<HttpResponse> {
@@ -835,11 +829,11 @@ impl TursoSyncServer {
             encode_length_delimited(&mut response_body, &page_bytes);
         }
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     #[allow(clippy::type_complexity)]
@@ -871,10 +865,42 @@ impl TursoSyncServer {
     }
 }
 
-struct HttpResponse {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
+/// Writes in small steps against an overall deadline instead of trusting a
+/// single `write_all` bounded only by a per-write socket timeout, and gives
+/// up as soon as the server is told to shut down - see `WRITE_DEADLINE` for
+/// why this exists. `deadline` is a parameter rather than always
+/// `WRITE_DEADLINE` so tests can use one far shorter than 120 seconds.
+fn write_response_bounded(
+    interrupt_count: &AtomicUsize,
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Duration,
+) -> Result<()> {
+    stream.set_write_timeout(Some(WRITE_POLL_TIMEOUT.min(deadline)))?;
+    let started = Instant::now();
+    let mut sent = 0;
+    while sent < bytes.len() {
+        if interrupt_count.load(Ordering::SeqCst) > 0 {
+            return Err(anyhow!(
+                "sync server interrupted while writing the response"
+            ));
+        }
+        if started.elapsed() > deadline {
+            return Err(anyhow!("writing the response took too long"));
+        }
+        match stream.write(&bytes[sent..]) {
+            Ok(0) => return Err(anyhow!("connection closed while writing the response")),
+            Ok(n) => sent += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    stream.flush()?;
+    Ok(())
 }
 
 struct MvccLogSnapshot {
@@ -1142,80 +1168,6 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
 
-/// A client controls Content-Length, so the end of the body has to be
-/// computed without trusting it to fit.
-fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
-    (header_end + 4)
-        .checked_add(content_length)
-        .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
-}
-
-fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
-    (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            let value = line.split(':').nth(1)?.trim();
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
-    let header_end = find_header_end(data, 0).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
-    let headers = String::from_utf8_lossy(&data[..header_end]);
-
-    let first_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("Empty request"))?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        return Err(anyhow!("Invalid request line"));
-    }
-
-    let method = parts[0].to_string();
-    let path = parts[1].to_string();
-    let body = data[header_end + 4..].to_vec();
-
-    Ok((method, path, body))
-}
-
-fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
-    let status_text = match resp.status {
-        200 => "OK",
-        204 => "No Content",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Unknown",
-    };
-
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         Access-Control-Expose-Headers: *\r\n\
-         \r\n",
-        resp.status,
-        status_text,
-        resp.content_type,
-        resp.body.len()
-    );
-
-    let mut result = header.into_bytes();
-    result.extend_from_slice(&resp.body);
-    result
-}
-
 fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
     let mut len = data.len();
     while len >= 0x80 {
@@ -1258,32 +1210,62 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
 
-    /// Mirrors the read loop: the terminator must be found whatever the chunk
-    /// boundaries, including when it straddles two reads.
     #[test]
-    fn finds_header_end_across_read_boundaries() {
-        let request = b"POST / HTTP/1.1\r\nHost: x\r\n\r\nbody".to_vec();
-        let expected = find_header_end(&request, 0).expect("terminator is present");
+    fn write_response_bounded_gives_up_once_the_deadline_passes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = TcpStream::connect(address).expect("connect"); // never reads
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let interrupt_count = AtomicUsize::new(0);
 
-        for chunk in 1..=request.len() {
-            let mut data = Vec::new();
-            let mut found = None;
-            for piece in request.chunks(chunk) {
-                let unscanned = data.len().saturating_sub(3);
-                data.extend_from_slice(piece);
-                if let Some(end) = find_header_end(&data, unscanned) {
-                    found = Some(end);
-                    break;
-                }
-            }
-            assert_eq!(found, Some(expected), "missed terminator at chunk {chunk}");
-        }
+        // Bigger than typical socket buffers, so the write below genuinely
+        // blocks instead of the whole payload being buffered by the kernel.
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = Instant::now();
+
+        let result = write_response_bounded(
+            &interrupt_count,
+            &mut server_stream,
+            &payload,
+            Duration::from_millis(800),
+        );
+
+        assert!(result.is_err(), "a stalled client must not block forever");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline should have cut the write off quickly: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
-    fn rejects_content_length_that_overflows() {
-        assert!(request_end(0, usize::MAX).is_err());
-        assert_eq!(request_end(10, 5).unwrap(), 19);
+    fn write_response_bounded_gives_up_once_interrupted() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = TcpStream::connect(address).expect("connect"); // never reads
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let interrupt_count = AtomicUsize::new(0);
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                write_response_bounded(
+                    &interrupt_count,
+                    &mut server_stream,
+                    &payload,
+                    Duration::from_secs(30),
+                )
+            });
+            thread::sleep(Duration::from_millis(200));
+            interrupt_count.store(1, Ordering::SeqCst);
+
+            let result = handle.join().expect("the writer thread does not panic");
+            assert!(
+                result.is_err(),
+                "an interrupted server must abandon a stalled write rather than wait out the deadline"
+            );
+        });
     }
 }

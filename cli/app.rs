@@ -82,6 +82,12 @@ pub struct Opts {
     pub mcp: bool,
     #[clap(
         long,
+        value_name = "ADDR",
+        help = "Start MCP server over Streamable HTTP at given address (e.g. 127.0.0.1:8081)"
+    )]
+    pub mcp_http: Option<String>,
+    #[clap(
+        long,
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
@@ -446,7 +452,7 @@ impl Limbo {
     }
 
     pub fn is_mcp_mode(&self) -> bool {
-        self.opts.mcp
+        self.opts.mcp || self.opts.mcp_http_address.is_some()
     }
 
     pub fn is_sync_server_mode(&self) -> bool {
@@ -455,6 +461,13 @@ impl Limbo {
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
         self.interrupt_count.clone()
+    }
+
+    /// The `--experimental-*` feature set (and friends) this CLI was started
+    /// with, so a tool that opens another database can carry them over
+    /// instead of silently falling back to defaults.
+    pub fn get_db_opts(&self) -> turso_core::DatabaseOpts {
+        self.db_opts
     }
 
     pub fn has_query_error(&self) -> bool {
