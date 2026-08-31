@@ -10,8 +10,9 @@ Turso includes a built-in MCP (Model Context Protocol) server that lets AI assis
 other tools work with your databases programmatically.
 
 The server speaks MCP **2026-07-28** ("v2"), and still answers the older `initialize`
-handshake used by revisions 2025-06-18, 2025-03-26 and 2024-11-05, so clients that have
-not moved to v2 keep working.
+handshake used by revisions 2025-06-18 and 2024-11-05, so clients that have not moved to
+v2 keep working. Revision 2025-03-26 is not offered: it is the one revision that required
+servers to accept JSON-RPC batch requests, which this server does not implement.
 
 ## Starting the MCP Server
 
@@ -202,7 +203,7 @@ Any MCP client works. A client that speaks a pre-2026 revision handshakes with
 - Ensure you have write permissions if modifying data
 
 ### HTTP requests are rejected
-- Every POST needs `MCP-Protocol-Version` and `Mcp-Method`; `tools/call` also needs `Mcp-Name`. They must match the body, or the server answers 400 with error `-32020`.
+- The routing headers are only required of a request that declares `MCP-Protocol-Version: 2026-07-28`: that POST also needs `Mcp-Method`, and `tools/call` also needs `Mcp-Name`. They must match the body, or the server answers 400 with error `-32020`. A pre-v2 client sends no `MCP-Protocol-Version` header and needs none of them.
 - A non-localhost `Origin` gets 403.
 
 ## See Also

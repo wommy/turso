@@ -13,7 +13,8 @@ use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
 use crate::http::{
-    cors_headers, format_http_response, read_http_request, HttpResponse, ReadLimits,
+    cors_headers, format_http_response, read_http_request, HttpRequest, HttpResponse, ReadLimits,
+    RequestError,
 };
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
@@ -23,6 +24,11 @@ use turso_sync_engine::server_proto::{
     PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
     PullUpdatesStreamKind, Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
+
+/// How long one request may take to arrive. The old code set this straight on
+/// the socket; it now travels with the read limits so the read loop can act on
+/// it rather than fail the connection outright.
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
@@ -114,11 +120,29 @@ impl TursoSyncServer {
 
     fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-        // The sync SDK is a trusted client, so it keeps the old unlimited reads.
-        let request =
-            read_http_request(&mut stream, &ReadLimits::unbounded()).map_err(|e| anyhow!("{e}"))?;
+        // The sync SDK is a trusted client, so it keeps the old unlimited body
+        // size, but not unlimited time: this server handles one connection at
+        // a time, so a client that connects and sends nothing would otherwise
+        // stop it serving anyone else. A malformed request (e.g. chunked,
+        // which this parser does not support) still gets a real response
+        // instead of a dropped socket.
+        let limits = ReadLimits::any_size(REQUEST_READ_TIMEOUT);
+        let response = match read_http_request(&mut stream, &limits) {
+            Ok(request) => self.route(request),
+            Err(RequestError::Refused(reason)) => HttpResponse::text(400, &reason),
+            Err(RequestError::Io(e)) => return Err(e),
+        };
+
+        let http_response = response.with_headers(cors_headers());
+        let response_bytes = format_http_response(&http_response);
+        stream.write_all(&response_bytes)?;
+        stream.flush()?;
+
+        Ok(())
+    }
+
+    fn route(&self, request: HttpRequest) -> HttpResponse {
         let (method, path, body) = (request.method, request.path, request.body);
         info!("Request: {} {}", method, path);
 
@@ -138,7 +162,7 @@ impl TursoSyncServer {
             }
         };
 
-        let http_response = match response {
+        match response {
             Ok(resp) => resp,
             Err(e) => {
                 error!("Request error: {}", e);
@@ -148,14 +172,7 @@ impl TursoSyncServer {
                     format!("Internal Server Error: {e}").into_bytes(),
                 )
             }
-        };
-
-        let http_response = http_response.with_headers(cors_headers());
-        let response_bytes = format_http_response(&http_response);
-        stream.write_all(&response_bytes)?;
-        stream.flush()?;
-
-        Ok(())
+        }
     }
 
     fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {

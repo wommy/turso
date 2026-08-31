@@ -6,7 +6,14 @@ pub const PROTOCOL_V2: &str = "2026-07-28";
 
 /// Newest first. Everything before v2 needs the `initialize` handshake; for a
 /// tools-only server those revisions are wire-compatible with each other.
-pub const SUPPORTED_VERSIONS: [&str; 4] = [PROTOCOL_V2, "2025-06-18", "2025-03-26", "2024-11-05"];
+///
+/// 2025-03-26 is deliberately left out: it is the one revision that required
+/// servers to accept JSON-RPC batch arrays (dropped again in 2025-06-18), and
+/// this server does not implement batching. `handle_message` deserializes a
+/// request straight off the top-level JSON value, so a batch sent under that
+/// revision would come back as one -32600 with every call in it silently
+/// dropped - better to say plainly that the revision is not supported.
+pub const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_V2, "2025-06-18", "2024-11-05"];
 
 /// Answer to a handshake asking for a version we do not know.
 pub const LEGACY_DEFAULT: &str = "2025-06-18";

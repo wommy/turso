@@ -140,7 +140,7 @@ says so, so add LIMIT/OFFSET or an aggregate instead of relying on a bigger cap.
                         "items": {
                             "type": "array",
                             "items": {
-                                "description": "NULL, a number, a string, or {\"blob\": \"<hex>\"}"
+                                "description": "NULL, a number, a string (a non-finite float - \"inf\", \"-inf\", \"NaN\" - comes through as a string too, since JSON has no such numbers), or {\"blob\": \"<hex>\"}"
                             }
                         }
                     },
@@ -309,9 +309,10 @@ impl TursoMcpServer {
 
     fn current_database(&self) -> Result<ToolOutput, String> {
         let path = self
-            .current_db_path
+            .session
             .lock()
             .unwrap()
+            .db_path
             .clone()
             .unwrap_or_else(|| ":memory:".to_string());
 
@@ -329,8 +330,9 @@ impl TursoMcpServer {
         // (e.g. `order`, `my table`) don't break the PRAGMA's own parsing.
         let query = format!("PRAGMA table_xinfo({})", quote_ident(table_name));
 
-        let conn = self.conn.lock().unwrap().clone();
-        let Some(mut rows) = conn
+        let session = self.session.lock().unwrap();
+        let Some(mut rows) = session
+            .conn
             .query(&query)
             .map_err(|e| format!("Error querying database: {e}"))?
         else {
@@ -405,8 +407,9 @@ impl TursoMcpServer {
         let query = validated_query(arguments, StmtClass::Select)?;
         let max_rows = max_rows_arg(arguments)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        let Some(mut rows) = conn
+        let session = self.session.lock().unwrap();
+        let Some(mut rows) = session
+            .conn
             .query(query)
             .map_err(|e| format!("Error executing query: {e}"))?
         else {
@@ -477,8 +480,9 @@ impl TursoMcpServer {
     fn list_tables(&self) -> Result<ToolOutput, String> {
         let query = "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1";
 
-        let conn = self.conn.lock().unwrap().clone();
-        let Some(mut rows) = conn
+        let session = self.session.lock().unwrap();
+        let Some(mut rows) = session
+            .conn
             .query(query)
             .map_err(|e| format!("Error querying database: {e}"))?
         else {
@@ -543,8 +547,13 @@ impl TursoMcpServer {
                 .map_err(|e| format!("Failed to connect to database '{path}': {e}"))?
         };
 
-        *self.conn.lock().unwrap() = conn;
-        *self.current_db_path.lock().unwrap() = Some(path.clone());
+        // Both fields change together under one lock, so a concurrent tool
+        // call on another connection can never see this call's new
+        // connection paired with the old path, or vice versa.
+        let mut session = self.session.lock().unwrap();
+        session.conn = conn;
+        session.db_path = Some(path.clone());
+        drop(session);
 
         let message = if created {
             format!("Created new empty database at {path}")
@@ -561,8 +570,10 @@ impl TursoMcpServer {
         self.require_writable()?;
         let query = validated_query(arguments, StmtClass::Schema)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        conn.execute(query)
+        let session = self.session.lock().unwrap();
+        session
+            .conn
+            .execute(query)
             .map_err(|e| format!("Error executing schema change: {e}"))?;
 
         Ok(ToolOutput::new(
@@ -580,11 +591,16 @@ impl TursoMcpServer {
         self.require_writable()?;
         let query = validated_query(arguments, class)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        conn.execute(query)
+        // `changes()` is a counter on the connection itself, set at the end
+        // of whichever statement last ran on it - so it has to be read
+        // before another client's tool call can run a statement of its own,
+        // which is exactly what holding `session` for both calls guarantees.
+        let session = self.session.lock().unwrap();
+        session
+            .conn
+            .execute(query)
             .map_err(|e| format!("Error executing {verb}: {e}"))?;
-
-        let changes = conn.changes();
+        let changes = session.conn.changes();
         let rows = if changes == 1 { "row" } else { "rows" };
         Ok(ToolOutput::new(
             format!("{verb} successful. {changes} {rows} changed."),
@@ -650,7 +666,11 @@ fn json_value(value: &DbValue) -> Value {
     match value {
         DbValue::Null => Value::Null,
         DbValue::Numeric(Numeric::Integer(i)) => json!(i),
-        DbValue::Numeric(Numeric::Float(f)) => json!(**f),
+        // JSON has no Infinity or NaN: serializing one of those as a number
+        // would silently become `null`, indistinguishable from an actual
+        // NULL. A string keeps the value visible instead.
+        DbValue::Numeric(Numeric::Float(f)) if f.is_finite() => json!(**f),
+        DbValue::Numeric(Numeric::Float(f)) => json!(f.to_string()),
         DbValue::Text(text) => json!(text.as_str()),
         DbValue::Blob(blob) => json!({ "blob": hex::encode(&blob[..]) }),
     }
@@ -830,7 +850,7 @@ mod tests {
     }
 
     fn seed_bench_orders(server: &TursoMcpServer) {
-        let conn = server.conn.lock().unwrap().clone();
+        let conn = server.session.lock().unwrap().conn.clone();
         conn.execute(
             "CREATE TABLE bench_orders (
                 order_id INTEGER PRIMARY KEY,
@@ -1019,6 +1039,22 @@ mod tests {
                 "truncated": false,
             })
         );
+    }
+
+    #[test]
+    fn non_finite_floats_come_through_as_strings_not_null() {
+        let server = memory_server();
+
+        let result =
+            call(&server, "execute_query", "SELECT 9e999, -9e999").expect("the query is valid");
+
+        let row = result.structured["rows"][0].as_array().unwrap();
+        for cell in row {
+            assert!(
+                cell.is_string(),
+                "a non-finite float must not collapse into JSON null: {row:?}"
+            );
+        }
     }
 
     #[test]

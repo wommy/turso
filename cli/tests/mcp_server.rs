@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 const PROTOCOL_V2: &str = "2026-07-28";
 
@@ -160,6 +161,127 @@ fn http_server_serves_a_v2_client() {
         ),
         403
     );
+}
+
+/// Two real HTTP clients hammer the same server concurrently. Before the
+/// server's connection and current path were merged behind one lock held for
+/// a whole tool call, `changes()` (a counter on the shared connection, set at
+/// the end of whichever statement last ran) could be read after a *different*
+/// client's statement ran on it: a 5-row DELETE from one client could report
+/// 1 change because the other client's single-row INSERT ran in between the
+/// DELETE's `execute` and its `changes()` read.
+#[test]
+fn http_server_keeps_change_counts_correct_under_concurrent_clients() {
+    let mut server = ServerProcess(
+        Command::new(env!("CARGO_BIN_EXE_tursodb"))
+            .args(["--mcp-http", "127.0.0.1:0"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run tursodb --mcp-http"),
+    );
+    let address = listening_address(&mut server.0);
+
+    for (id, table) in [(1, "t"), (2, "u")] {
+        let created = call(
+            &address,
+            id,
+            "schema_change",
+            &format!(r#"{{"query":"CREATE TABLE {table} (id INTEGER)"}}"#),
+        );
+        assert_eq!(
+            created.json()["result"]["isError"],
+            false,
+            "{}",
+            created.body
+        );
+    }
+
+    let iterations = 100u32;
+    std::thread::scope(|scope| {
+        // Repeatedly fills `t` with 5 rows and empties it again in one
+        // DELETE, which must always report exactly 5 changes.
+        scope.spawn(|| {
+            for i in 0..iterations {
+                let insert = call(
+                    &address,
+                    1000 + i,
+                    "insert_data",
+                    r#"{"query":"INSERT INTO t VALUES (1),(2),(3),(4),(5)"}"#,
+                );
+                assert_eq!(insert.json()["result"]["isError"], false, "{}", insert.body);
+
+                let delete = call(
+                    &address,
+                    2000 + i,
+                    "delete_data",
+                    r#"{"query":"DELETE FROM t"}"#,
+                );
+                assert_eq!(
+                    delete.json()["result"]["structuredContent"]["changes"],
+                    5,
+                    "a 5-row delete must report 5 changes even while another client writes: {}",
+                    delete.body
+                );
+            }
+        });
+
+        // Runs single-row inserts against a different table at the same
+        // time, so its statements land on the shared connection in between
+        // the other thread's DELETE and its changes() read, if nothing
+        // serializes the two.
+        scope.spawn(|| {
+            for i in 0..iterations {
+                let arguments = format!(r#"{{"query":"INSERT INTO u VALUES ({i})"}}"#);
+                let insert = call(&address, 3000 + i, "insert_data", &arguments);
+                assert_eq!(insert.json()["result"]["isError"], false, "{}", insert.body);
+            }
+        });
+    });
+}
+
+/// A `tools/call` POST with the v2 routing headers already set.
+fn call(address: &str, id: u32, name: &str, arguments: &str) -> HttpReply {
+    post(
+        address,
+        &[
+            ("MCP-Protocol-Version", PROTOCOL_V2),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", name),
+        ],
+        &tools_call(id, name, arguments),
+    )
+}
+
+/// 64 connections park their threads mid-request (never sending enough to
+/// complete one), holding a slot against the server's connection cap each.
+/// A 65th connection must be refused outright rather than spawning an
+/// unbounded 65th thread.
+#[test]
+fn http_server_answers_503_once_connections_exceed_the_cap() {
+    let mut server = ServerProcess(
+        Command::new(env!("CARGO_BIN_EXE_tursodb"))
+            .args(["--mcp-http", "127.0.0.1:0"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run tursodb --mcp-http"),
+    );
+    let address = listening_address(&mut server.0);
+
+    let idle_connections: Vec<TcpStream> = (0..64)
+        .map(|_| TcpStream::connect(&address).expect("connect"))
+        .collect();
+    // Lets the accept loop pick up and spawn a thread for all 64 before the
+    // 65th connection is attempted below.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let status = raw_request(&address, "GET /mcp HTTP/1.1");
+
+    assert_eq!(
+        status, 503,
+        "the 65th connection must be refused once the cap of 64 is reached"
+    );
+
+    drop(idle_connections);
 }
 
 fn raw_request(address: &str, request_line: &str) -> u16 {

@@ -21,10 +21,20 @@ Pick a database file with open_database, look around with list_tables and descri
 then run one statement per call with execute_query, insert_data, update_data, delete_data \
 or schema_change.";
 
+/// The connection a tool call runs against, and the path it was opened from.
+/// Kept behind one lock so the two can never disagree: `open_database` sets
+/// both together, and every tool call holds the lock for its whole duration,
+/// so a second client can never run a statement between another client's
+/// `execute` and its matching `changes()`, or between an `open_database` and
+/// the query that follows it.
+struct Session {
+    conn: Arc<Connection>,
+    db_path: Option<String>,
+}
+
 pub struct TursoMcpServer {
-    conn: Arc<Mutex<Arc<Connection>>>,
+    session: Mutex<Session>,
     interrupt_count: Arc<AtomicUsize>,
-    current_db_path: Arc<Mutex<Option<String>>>,
     /// Applied to every database `open_database` opens, so a database opened
     /// through the tool gets the same `--experimental-*` features as the one
     /// the CLI started with.
@@ -48,9 +58,8 @@ impl TursoMcpServer {
         readonly: bool,
     ) -> Self {
         Self {
-            conn: Arc::new(Mutex::new(conn)),
+            session: Mutex::new(Session { conn, db_path }),
             interrupt_count,
-            current_db_path: Arc::new(Mutex::new(db_path)),
             db_opts,
             readonly,
         }
@@ -381,6 +390,46 @@ mod tests {
 
         assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(response["result"]["serverInfo"]["name"], "turso-mcp");
+    }
+
+    #[test]
+    fn initialize_no_longer_negotiates_2025_03_26() {
+        // That revision required accepting JSON-RPC batch arrays, which this
+        // server does not implement, so it must not be offered.
+        let server = memory_server();
+
+        let response = send(
+            &server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-03-26" },
+            }),
+        )
+        .expect("initialize is a request");
+
+        assert_eq!(response["result"]["protocolVersion"], LEGACY_DEFAULT);
+    }
+
+    #[test]
+    fn a_request_naming_2025_03_26_is_rejected_as_unsupported() {
+        let server = memory_server();
+
+        let response = send(
+            &server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {
+                    "_meta": { "io.modelcontextprotocol/protocolVersion": "2025-03-26" }
+                },
+            }),
+        )
+        .expect("tools/list is a request");
+
+        assert_eq!(response["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION);
     }
 
     #[test]
