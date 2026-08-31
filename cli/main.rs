@@ -6,7 +6,7 @@ mod dot_command;
 mod helper;
 mod input;
 mod manual;
-mod mcp_server;
+mod mcp;
 mod opcodes_dictionary;
 mod read_state_machine;
 mod sync_server;
@@ -15,7 +15,7 @@ mod sync_server;
 mod mvcc_repl;
 
 use config::CONFIG_DIR;
-use mcp_server::TursoMcpServer;
+use mcp::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,

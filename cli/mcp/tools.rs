@@ -1,59 +1,13 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use super::protocol::{CallToolRequest, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use super::TursoMcpServer;
 use serde_json::{json, Value};
-use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 use turso_core::{
     Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect, Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    params: Option<Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct InitializeRequest {
-    #[serde(rename = "protocolVersion")]
-    protocol_version: String,
-    capabilities: Value,
-    #[serde(rename = "clientInfo")]
-    client_info: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CallToolRequest {
-    name: String,
-    arguments: Option<Value>,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StmtClass {
@@ -160,145 +114,8 @@ fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, 
     Ok(sql)
 }
 
-pub struct TursoMcpServer {
-    conn: Arc<Mutex<Arc<Connection>>>,
-    interrupt_count: Arc<AtomicUsize>,
-    current_db_path: Arc<Mutex<Option<String>>>,
-}
-
 impl TursoMcpServer {
-    pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
-        Self {
-            conn: Arc::new(Mutex::new(conn)),
-            interrupt_count,
-            current_db_path: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn run(&self) -> Result<()> {
-        let stdout = io::stdout();
-        let mut stdout_lock = stdout.lock();
-
-        // Create a channel to receive lines from stdin
-        let (tx, rx) = mpsc::channel();
-
-        // Spawn a thread to read from stdin
-        thread::spawn(move || {
-            let stdin = io::stdin();
-            let reader = BufReader::new(stdin);
-
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        if tx.send(Ok(line)).is_err() {
-                            break; // Main thread has dropped the receiver
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        break;
-                    }
-                }
-            }
-        });
-
-        loop {
-            // Check if we've been interrupted
-            if self.interrupt_count.load(Ordering::SeqCst) > 0 {
-                eprintln!("MCP server interrupted, shutting down...");
-                break;
-            }
-
-            // Try to receive a line with a timeout so we can check for interruption
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Ok(line)) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-
-                    let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                        Ok(req) => req,
-                        Err(e) => {
-                            eprintln!("Failed to parse JSON-RPC request: {e}");
-                            continue;
-                        }
-                    };
-
-                    let response = self.handle_request(request);
-                    // Don't send a response for notifications (when id is None)
-                    if response.id.is_some() || response.error.is_some() {
-                        let response_json = serde_json::to_string(&response)?;
-                        writeln!(stdout_lock, "{response_json}")?;
-                        stdout_lock.flush()?;
-                    }
-                }
-                Ok(Err(_)) => {
-                    // Error reading from stdin
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Timeout - continue loop to check for interruption
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Stdin thread has finished (EOF)
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
-        // Check if this is a notification (no id field means it's a notification)
-        // Notifications should not receive a response according to JSON-RPC spec
-        if request.id.is_none() {
-            // For notifications, we return a special response that the caller should ignore
-            return JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: None,
-                result: None,
-                error: None,
-            };
-        }
-
-        match request.method.as_str() {
-            "initialize" => self.handle_initialize(request),
-            "tools/list" => self.handle_list_tools(request),
-            "tools/call" => self.handle_call_tool(request),
-            _ => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32601,
-                    message: "Method not found".to_string(),
-                    data: None,
-                }),
-            },
-        }
-    }
-
-    fn handle_initialize(&self, request: JsonRpcRequest) -> JsonRpcResponse {
-        JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "turso-mcp",
-                    "version": "1.0.0"
-                }
-            })),
-            error: None,
-        }
-    }
-
-    fn handle_list_tools(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    pub(crate) fn handle_list_tools(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: request.id,
@@ -426,7 +243,7 @@ impl TursoMcpServer {
         }
     }
 
-    fn handle_call_tool(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    pub(crate) fn handle_call_tool(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let tool_request: CallToolRequest = match request.params.as_ref() {
             Some(params) => match serde_json::from_value(params.clone()) {
                 Ok(req) => req,
@@ -776,6 +593,7 @@ impl TursoMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn memory_server() -> TursoMcpServer {
         let (_io, conn) =
