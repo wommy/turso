@@ -172,22 +172,27 @@ Running in GitHub Action? Max-turns limit in `.github/workflows/claude.yml`. OK 
 
 Config for Matt Pocock's engineering skills (`github.com/mattpocock/skills`):
 `/grill-with-docs`, `/to-spec`, `/to-tickets`, `/implement`, `/tdd`,
-`/code-review`. Written by `/setup-matt-pocock-skills`.
+`/code-review`, `/triage`. Written by `/setup-matt-pocock-skills`.
 
 This branch is **not for upstream**. It exists so the config is durable and
-reviewable somewhere, without putting it in a pull request that Turso is meant
-to take. See `docs/adr/0001-agent-config-lives-on-its-own-branch.md`.
+reviewable somewhere, without putting it in a pull request Turso is meant to
+take. See `docs/adr/0001-agent-config-lives-on-its-own-branch.md`.
+
+Install the skills with `./scripts/bootstrap-agent-skills.sh`; they land in
+`~/.claude/skills`, outside this repo. Full notes, including the contended
+`code-review` name, are in `docs/agents/README.md`.
 
 ### Issue tracker
 
 GitHub issues on this fork, reached through `gh` locally or the `mcp__github__*`
 tools in a remote container; `.scratch/` holds drafts nobody else needs yet.
-See `docs/agents/issue-tracker.md`.
+See `docs/agents/issue-tracker.md` and
+`docs/adr/0003-one-tracker-two-spellings.md`.
 
 ### Triage labels
 
-Not configured — the `triage` skill is not installed. Re-run
-`/setup-matt-pocock-skills` if it ever is.
+The five canonical roles, kept as-is. They do not exist on the fork yet, so
+`/triage` will fail until they are created — see `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

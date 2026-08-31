@@ -6,9 +6,11 @@ written by `/setup-matt-pocock-skills`.
 | File | What it is |
 |---|---|
 | `issue-tracker.md` | Where issues live, and the two spellings for reaching GitHub |
+| `triage-labels.md` | The five triage roles, and the labels they map to |
 | `domain.md` | What to read before exploring, and why there is no `CONTEXT-MAP.md` |
 | `../../CONTEXT.md` | The glossary |
 | `../adr/` | Decisions |
+| `../../scripts/bootstrap-agent-skills.sh` | Reinstall the skills in a fresh container |
 
 ## This branch is not for upstream
 
@@ -22,18 +24,53 @@ Work it as a worktree rather than switching branches in place:
 git worktree add ../turso-agent-config claude/agent-config
 ```
 
-## The skills are not vendored
+## Installing the skills
 
-They live at `github.com/mattpocock/skills` and are cloned when needed. They are
-deliberately not copied into `.claude/skills/`, for two reasons: that directory
-is tracked by upstream, and it already contains a `code-review` skill whose name
-would collide with Matt's.
+The skills repo ships its own installer. It symlinks every skill into
+`~/.claude/skills` and `~/.agents/skills` — both **outside this repo**, so
+nothing touches the tracked `.claude/skills/` directory and nothing shows up in
+`git status`:
+
+```bash
+./scripts/bootstrap-agent-skills.sh
+```
+
+That clones (or updates) the skills repo and runs its `link-skills.sh`. Because
+every skill is a symlink into the clone, `git pull` there updates all of them at
+once.
+
+Two things to know:
+
+- **`link-skills.sh` also links the `in-progress/` skills** — `implement-spec`,
+  `loop-me`, `retro`, `writing-beats`, `writing-fragments`, `writing-shape`,
+  `setup-ts-deep-modules`, `claude-handoff`. Only `deprecated/` is excluded.
+  They are the author's work-in-progress, not part of the documented flow.
+- **Do not also install the Claude Code plugin.** `mattpocock-skills` is enabled
+  on this account but has never materialised in a remote container, which is why
+  we install from source. If it ever does materialise alongside this, the repo's
+  README warns you get every skill twice.
+
+## The `code-review` name is contended
+
+Two different things answer to `code-review`:
+
+- **Matt's**: a two-axis review — Standards (repo standards plus a Fowler smell
+  baseline) and Spec (does the diff do what was asked) — run as parallel
+  subagents whose findings are deliberately never merged or reranked. This is
+  the one `/implement` calls into.
+- **The harness built-in**: correctness bugs and cleanups at a chosen effort
+  level, with `--comment` to post inline PR comments and `--fix` to apply
+  findings. It has **no file on disk**; it is provided by the CLI itself, so it
+  cannot be renamed, relinked, or copied.
+
+Matt's owns the name here. Because the built-in cannot be moved out of the way,
+the alias goes on Matt's instead: **`two-axis-review`** always means his,
+whichever way the bare name resolves. Nothing is lost — ask for the built-in by
+what it does (a correctness pass, or `--fix`/`--comment`) and it is still there.
 
 ## Setup notes
 
-- **Triage labels** are not configured, because the `triage` skill is not
-  installed. Section B of the setup skill is skipped entirely; re-run it if that
-  changes.
-- **`.scratch/`** is the draft layer and is gitignored, so it appears in neither
-  this branch nor any other. Anything another person must act on gets promoted to
-  a GitHub issue.
+- **`.scratch/`** is the draft layer and is gitignored, so it appears in no
+  branch. Anything another person must act on gets promoted to a GitHub issue.
+- **The triage labels do not exist on the fork yet** — see `triage-labels.md`
+  for the one command that creates them. `/triage` will fail until they do.

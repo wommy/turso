@@ -17,6 +17,11 @@ die with the container, and nobody else can see or review them.
 
 ## Consequences
 
+The skills install into `~/.claude/skills` and `~/.agents/skills` via the skills
+repo's own `scripts/link-skills.sh`, so nothing lands in this repo's tracked
+`.claude/skills/`. Both directories are outside the repo and die with a
+container, which `scripts/bootstrap-agent-skills.sh` exists to undo.
+
 Checking this branch out replaces the working tree, so use a worktree
 (`git worktree add ../turso-agent-config claude/agent-config`) rather than
 switching branches in place while feature work is in flight.
