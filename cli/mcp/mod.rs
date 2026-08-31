@@ -12,7 +12,7 @@ use turso_core::Connection;
 
 use protocol::{
     server_info, JsonRpcError, JsonRpcRequest, JsonRpcResponse, CACHE_TTL_MS, INVALID_PARAMS,
-    LEGACY_DEFAULT, METHOD_NOT_FOUND, PARSE_ERROR, SUPPORTED_VERSIONS,
+    INVALID_REQUEST, LEGACY_DEFAULT, METHOD_NOT_FOUND, PARSE_ERROR, SUPPORTED_VERSIONS,
 };
 use tools::ToolOutput;
 
@@ -28,11 +28,17 @@ pub struct TursoMcpServer {
 }
 
 impl TursoMcpServer {
-    pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+    /// `db_path` is the database the CLI already opened, so that
+    /// `current_database` reports it instead of claiming an in-memory one.
+    pub fn new(
+        conn: Arc<Connection>,
+        interrupt_count: Arc<AtomicUsize>,
+        db_path: Option<String>,
+    ) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
-            current_db_path: Arc::new(Mutex::new(None)),
+            current_db_path: Arc::new(Mutex::new(db_path)),
         }
     }
 
@@ -47,14 +53,22 @@ impl TursoMcpServer {
     /// One JSON-RPC message in, at most one message out. Notifications get no
     /// reply, which is what `None` means here.
     fn handle_message(&self, message: &str) -> Option<String> {
-        let request: JsonRpcRequest = match serde_json::from_str(message) {
+        let json: Value = match serde_json::from_str(message) {
+            Ok(json) => json,
+            Err(e) => {
+                let error = JsonRpcError::new(PARSE_ERROR, format!("Invalid JSON: {e}"));
+                return Some(encode(&JsonRpcResponse::failure(None, error)));
+            }
+        };
+        // Valid JSON that is not a JSON-RPC request is an invalid request
+        // rather than a parse error, and the client still gets its id back.
+        let request: JsonRpcRequest = match serde_json::from_value(json.clone()) {
             Ok(request) => request,
             Err(e) => {
-                let error = JsonRpcError::new(
-                    PARSE_ERROR,
-                    format!("Failed to parse JSON-RPC request: {e}"),
-                );
-                return Some(encode(&JsonRpcResponse::failure(None, error)));
+                let id = json.get("id").cloned();
+                let error =
+                    JsonRpcError::new(INVALID_REQUEST, format!("Not a JSON-RPC request: {e}"));
+                return Some(encode(&JsonRpcResponse::failure(id, error)));
             }
         };
 
@@ -67,8 +81,12 @@ impl TursoMcpServer {
         request.id.as_ref()?;
         let id = request.id.clone();
 
-        // `initialize` carries its version in the params, not in `_meta`.
-        if request.method != "initialize" {
+        // `initialize` carries its version in the params, not in `_meta`, and
+        // discovery is how a client finds out which versions exist, so neither
+        // is turned away for naming a version we do not know.
+        let negotiates_version =
+            matches!(request.method.as_str(), "initialize" | "server/discover");
+        if !negotiates_version {
             if let Err(error) = request.check_protocol_version() {
                 return Some(JsonRpcResponse::failure(id, error));
             }
@@ -186,12 +204,17 @@ fn tool_result(result: Result<ToolOutput, String>) -> Value {
 
 #[cfg(test)]
 fn memory_server() -> TursoMcpServer {
+    server_on(None)
+}
+
+#[cfg(test)]
+fn server_on(db_path: Option<String>) -> TursoMcpServer {
     use turso_core::{DatabaseOpts, SqliteDialect};
 
     let (_io, conn) =
         Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
             .expect("open memory database");
-    TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)))
+    TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), db_path)
 }
 
 #[cfg(test)]
@@ -422,6 +445,48 @@ mod tests {
         );
 
         assert!(reply.is_none());
+    }
+
+    #[test]
+    fn json_that_is_not_a_jsonrpc_request_is_an_invalid_request() {
+        let server = memory_server();
+
+        let reply = server
+            .handle_message(&json!({ "id": 4, "method": "tools/list" }).to_string())
+            .expect("an invalid request is reported");
+        let response: Value = serde_json::from_str(&reply).unwrap();
+
+        assert_eq!(response["error"]["code"], INVALID_REQUEST);
+        assert_eq!(response["id"], 4, "the client gets its id back");
+    }
+
+    #[test]
+    fn discovery_answers_a_version_we_do_not_know() {
+        let server = memory_server();
+
+        let response = send(
+            &server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {
+                    "_meta": { "io.modelcontextprotocol/protocolVersion": "2099-01-01" }
+                },
+            }),
+        )
+        .expect("discover is a request");
+
+        assert_eq!(response["result"]["supportedVersions"][0], PROTOCOL_V2);
+    }
+
+    #[test]
+    fn current_database_reports_the_file_the_server_started_on() {
+        let server = server_on(Some("mydata.db".to_string()));
+
+        let response = call(&server, "current_database", json!({}));
+
+        assert_eq!(response["result"]["structuredContent"]["path"], "mydata.db");
     }
 
     #[test]

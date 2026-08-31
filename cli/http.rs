@@ -1,9 +1,45 @@
 use std::io::Read;
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+/// What a caller is willing to read from a client it does not trust.
+pub struct ReadLimits {
+    pub max_body_bytes: usize,
+    /// How long one request may take to arrive, however slowly it is fed.
+    pub max_duration: Duration,
+}
+
+impl ReadLimits {
+    /// Reads whatever the client sends, for as long as it takes. Only safe
+    /// where the client is not hostile.
+    pub fn unbounded() -> Self {
+        Self {
+            max_body_bytes: usize::MAX,
+            max_duration: Duration::MAX,
+        }
+    }
+}
+
+pub enum RequestError {
+    /// The client sent something we will not read. There is a live connection
+    /// to answer on, so a caller can turn this into a 400.
+    Refused(String),
+    /// The connection itself failed; there is nobody left to answer.
+    Io(anyhow::Error),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => write!(f, "{reason}"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
 
 pub struct HttpRequest {
     pub method: String,
@@ -43,17 +79,27 @@ impl HttpResponse {
     }
 
     pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
-        self.extra_headers = headers;
+        self.extra_headers.extend(headers);
         self
     }
 }
 
-pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+pub fn read_http_request(
+    stream: &mut TcpStream,
+    limits: &ReadLimits,
+) -> Result<HttpRequest, RequestError> {
+    let started = Instant::now();
     let mut buffer = [0u8; 8192];
     let mut request_data = Vec::new();
 
     loop {
-        let n = stream.read(&mut buffer)?;
+        if started.elapsed() > limits.max_duration {
+            return Err(RequestError::Refused(
+                "HTTP request took too long to arrive".to_string(),
+            ));
+        }
+
+        let n = stream.read(&mut buffer).map_err(io_failed)?;
         if n == 0 {
             break;
         }
@@ -64,17 +110,36 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
 
         let Some(header_end) = find_header_end(&request_data, unscanned) else {
             if request_data.len() > MAX_HEADER_BYTES {
-                return Err(anyhow!(
+                return Err(RequestError::Refused(format!(
                     "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
-                ));
+                )));
             }
             continue;
         };
         let headers = String::from_utf8_lossy(&request_data[..header_end]);
+        // A chunked body has no Content-Length, so reading it as one would
+        // silently treat the first chunk header as the body.
+        if header_names(&headers).any(|name| name == "transfer-encoding") {
+            return Err(RequestError::Refused(
+                "Chunked request bodies are not supported; send Content-Length".to_string(),
+            ));
+        }
         if let Some(content_length) = parse_content_length(&headers) {
-            let total_expected = request_end(header_end, content_length)?;
+            if content_length > limits.max_body_bytes {
+                return Err(RequestError::Refused(format!(
+                    "Request body of {content_length} bytes exceeds the {} byte limit",
+                    limits.max_body_bytes
+                )));
+            }
+            let total_expected =
+                request_end(header_end, content_length).map_err(RequestError::Io)?;
             while request_data.len() < total_expected {
-                let n = stream.read(&mut buffer)?;
+                if started.elapsed() > limits.max_duration {
+                    return Err(RequestError::Refused(
+                        "HTTP request took too long to arrive".to_string(),
+                    ));
+                }
+                let n = stream.read(&mut buffer).map_err(io_failed)?;
                 if n == 0 {
                     break;
                 }
@@ -84,7 +149,19 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         break;
     }
 
-    parse_http_request(&request_data)
+    parse_http_request(&request_data).map_err(RequestError::Io)
+}
+
+fn io_failed(e: std::io::Error) -> RequestError {
+    RequestError::Io(anyhow!(e))
+}
+
+fn header_names(headers: &str) -> impl Iterator<Item = String> + '_ {
+    headers
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim().to_lowercase())
 }
 
 pub fn parse_http_request(data: &[u8]) -> Result<HttpRequest> {
@@ -129,6 +206,8 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     None
 }
 
+/// A client controls Content-Length, so the end of the body has to be computed
+/// without trusting it to fit.
 fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
     (header_end + 4)
         .checked_add(content_length)
@@ -214,6 +293,70 @@ mod tests {
     fn rejects_content_length_that_overflows() {
         assert!(request_end(0, usize::MAX).is_err());
         assert_eq!(request_end(10, 5).unwrap(), 19);
+    }
+
+    fn read_from_client(raw: &[u8], limits: &ReadLimits) -> Result<HttpRequest, RequestError> {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let raw = raw.to_vec();
+        std::thread::spawn(move || {
+            let mut client = TcpStream::connect(address).expect("connect");
+            let _ = client.write_all(&raw);
+            let _ = client.flush();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        read_http_request(&mut stream, limits)
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_refused_before_it_is_read() {
+        let limits = ReadLimits {
+            max_body_bytes: 1024,
+            max_duration: Duration::from_secs(5),
+        };
+        let raw = b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 9999999999\r\n\r\n";
+
+        let error = read_from_client(raw, &limits).err().expect("refused");
+
+        assert!(
+            matches!(&error, RequestError::Refused(reason) if reason.contains("exceeds")),
+            "expected a refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_is_refused_rather_than_misread() {
+        let raw = b"POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
+
+        let error = read_from_client(raw, &ReadLimits::unbounded())
+            .err()
+            .expect("refused");
+
+        assert!(
+            matches!(&error, RequestError::Refused(reason) if reason.contains("Chunked")),
+            "expected a refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn the_sync_server_keeps_its_cors_headers() {
+        let response = HttpResponse::text(200, "ok").with_headers(cors_headers());
+
+        let rendered = String::from_utf8(format_http_response(&response)).expect("utf-8");
+
+        assert!(
+            rendered.contains("Access-Control-Allow-Origin: *"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"));
     }
 
     #[test]

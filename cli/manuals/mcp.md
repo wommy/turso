@@ -27,13 +27,18 @@ Over Streamable HTTP:
 /path/to/tursodb --mcp-http 127.0.0.1:8081
 ```
 
-Both start without a database connection, so you pick or create one with the
-`open_database` tool. Pass a database file (`tursodb mydata.db --mcp`) to start with one
-already open.
+Started without a database file, both connect to a throwaway in-memory database, and
+anything written there is lost when the server exits. Pass a file
+(`tursodb mydata.db --mcp`) to work on real data, or point the server at one at any time
+with the `open_database` tool.
 
 The HTTP transport serves a single endpoint, `POST /mcp`. It rejects requests whose
 `Origin` is not localhost, so a web page cannot reach your databases through DNS
 rebinding. Bind it to a loopback address unless you know you want it exposed.
+
+One server holds one connection, shared by every HTTP client it serves. If two clients
+use the same server, an `open_database` call from one of them redirects the other's
+queries to the new file. Run one server per client if that matters.
 
 ## Discovery
 

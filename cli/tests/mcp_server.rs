@@ -74,12 +74,14 @@ fn stdio_server_serves_a_v2_client() {
 
 #[test]
 fn http_server_serves_a_v2_client() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .args(["--mcp-http", "127.0.0.1:0"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to run tursodb --mcp-http");
-    let address = listening_address(&mut child);
+    let mut server = ServerProcess(
+        Command::new(env!("CARGO_BIN_EXE_tursodb"))
+            .args(["--mcp-http", "127.0.0.1:0"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run tursodb --mcp-http"),
+    );
+    let address = listening_address(&mut server.0);
 
     let discover = post(
         &address,
@@ -140,8 +142,57 @@ fn http_server_serves_a_v2_client() {
     assert_eq!(mismatched.status, 400);
     assert_eq!(mismatched.json()["error"]["code"], -32020);
 
-    child.kill().expect("stop the server");
-    child.wait().expect("reap the server");
+    // A pre-v2 client sends none of the v2 routing headers.
+    let legacy = post(
+        &address,
+        &[],
+        r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#,
+    );
+    assert_eq!(legacy.status, 200, "{}", legacy.body);
+    assert_eq!(legacy.json()["result"]["protocolVersion"], "2024-11-05");
+
+    assert_eq!(raw_request(&address, "GET /mcp HTTP/1.1"), 405);
+    assert_eq!(
+        raw_request_with(
+            &address,
+            "POST /mcp HTTP/1.1",
+            &["Origin: https://evil.example"]
+        ),
+        403
+    );
+}
+
+fn raw_request(address: &str, request_line: &str) -> u16 {
+    raw_request_with(address, request_line, &[])
+}
+
+fn raw_request_with(address: &str, request_line: &str, headers: &[&str]) -> u16 {
+    let mut stream = TcpStream::connect(address).expect("connect to the MCP endpoint");
+    let mut request = format!("{request_line}\r\nHost: {address}\r\n");
+    for header in headers {
+        request.push_str(header);
+        request.push_str("\r\n");
+    }
+    request.push_str("Content-Length: 0\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("send request");
+
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("read reply");
+    raw.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code")
+}
+
+/// Kills the server even when an assertion unwinds first.
+struct ServerProcess(Child);
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn tools_call(id: u32, name: &str, arguments: &str) -> String {

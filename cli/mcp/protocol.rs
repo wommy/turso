@@ -15,6 +15,7 @@ pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion
 pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 pub const PARSE_ERROR: i32 = -32700;
+pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const HEADER_MISMATCH: i32 = -32020;

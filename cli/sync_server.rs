@@ -12,7 +12,9 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
-use crate::http::{cors_headers, format_http_response, read_http_request, HttpResponse};
+use crate::http::{
+    cors_headers, format_http_response, read_http_request, HttpResponse, ReadLimits,
+};
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
@@ -114,7 +116,9 @@ impl TursoSyncServer {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-        let request = read_http_request(&mut stream)?;
+        // The sync SDK is a trusted client, so it keeps the old unlimited reads.
+        let request =
+            read_http_request(&mut stream, &ReadLimits::unbounded()).map_err(|e| anyhow!("{e}"))?;
         let (method, path, body) = (request.method, request.path, request.body);
         info!("Request: {} {}", method, path);
 
@@ -1091,8 +1095,6 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
 
-/// A client controls Content-Length, so the end of the body has to be
-/// computed without trusting it to fit.
 fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
     let mut len = data.len();
     while len >= 0x80 {
