@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod dot_command;
 mod helper;
+mod http;
 mod input;
 mod manual;
 mod mcp;
