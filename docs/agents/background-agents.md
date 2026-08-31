@@ -33,6 +33,28 @@ wrong for anything where the correct move on a surprise is a judgement call.
   without the change. Upstream asks for this explicitly and it matters most when
   the tests were written by a model.
 
+## Investigation and verification want different shapes
+
+Not every agent should get a schema, and the split is not cheap-model versus
+expensive-model.
+
+**Verification is structured.** "Run these commands, report what happened" has a
+right answer, and prose lets an agent be confident instead of correct. Every
+misleading report so far came from this kind of task.
+
+**Investigation is prose.** "Find out what upstream thinks about MCP", "where do
+the SDKs put `_meta`", "what is eating the disk" — the shape of the answer is not
+known in advance, and forcing it into `checks[]` throws away the reasoning that
+makes it worth having. These have been consistently excellent, and a schema would
+have made them worse.
+
+The tell: if you can write the list of commands before the agent starts, use the
+schema. If you cannot, do not.
+
+Investigation briefs still borrow the discipline, just not the shape — say what
+counts as a finding, forbid the foreseeable workarounds, demand honesty about
+confidence, and list what has already been settled so it is not re-litigated.
+
 ## Structured in, structured out
 
 Do not brief in prose and do not accept a prose report. Both have schemas:
