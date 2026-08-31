@@ -191,8 +191,7 @@ See `docs/agents/issue-tracker.md` and
 
 ### Triage labels
 
-The five canonical roles, kept as-is. Only `wontfix` exists on the fork today,
-so `/triage` fails until the other four are created — see
+The five canonical roles, kept as-is and all present on the fork. See
 `docs/agents/triage-labels.md`.
 
 ### Domain docs

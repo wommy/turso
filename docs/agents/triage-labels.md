@@ -16,24 +16,32 @@ vocabulary is aimed at a public OSS triage queue; these five are aimed at one
 question an agent has to answer — is this ticket ready to be worked unattended —
 and nothing upstream uses says that.
 
-## Four of these five do not exist yet
+## All five exist on the fork
 
-`wontfix` already exists on the fork, inherited from upstream Turso (white,
-"This will not be worked on"), and its meaning already matches — leave it alone.
-The other four need creating, and **`/triage` fails until they are**.
+Verified present. `wontfix` came from upstream Turso; the other four were
+created for these skills:
 
-They were not created here because the GitHub MCP server has no label-creation
-tool and the remote container has no `gh`. Run this from a machine that does:
+| Label | Colour | Description |
+| --- | --- | --- |
+| `needs-triage` | `fbca04` | Maintainer needs to evaluate this issue |
+| `needs-info` | `d876e3` | Waiting on reporter for more information |
+| `ready-for-agent` | `0e8a16` | Fully specified, ready for an AFK agent |
+| `ready-for-human` | `1d76db` | Requires human implementation |
+| `wontfix` | `ffffff` | This will not be worked on (upstream's wording) |
+
+To recreate them on another fork, from a machine with `gh` — there is no
+label-creation tool in the GitHub MCP server, so this cannot be done from a
+remote container:
 
 ```bash
-gh label create needs-triage    --repo wommy/turso --color fbca04 --description "Maintainer needs to evaluate this issue"
-gh label create needs-info      --repo wommy/turso --color d876e3 --description "Waiting on reporter for more information"
-gh label create ready-for-agent --repo wommy/turso --color 0e8a16 --description "Fully specified, ready for an AFK agent"
-gh label create ready-for-human --repo wommy/turso --color 1d76db --description "Requires human implementation"
+gh label create needs-triage    --repo <owner>/turso --color fbca04 --description "Maintainer needs to evaluate this issue"
+gh label create needs-info      --repo <owner>/turso --color d876e3 --description "Waiting on reporter for more information"
+gh label create ready-for-agent --repo <owner>/turso --color 0e8a16 --description "Fully specified, ready for an AFK agent"
+gh label create ready-for-human --repo <owner>/turso --color 1d76db --description "Requires human implementation"
 ```
 
-`gh label create` errors on a label that already exists; pass `--force` to
-overwrite instead. Do not create `wontfix` — it will fail as a duplicate.
+`wontfix` ships with most GitHub repos already; `gh label create` errors on a
+duplicate, so pass `--force` to overwrite instead.
 
-Edit the middle column above if the vocabulary ever changes; the skills read the
-label string from there, not from the role name.
+Edit the middle column of the role table above if the vocabulary ever changes;
+the skills read the label string from there, not from the role name.
