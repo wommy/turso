@@ -59,6 +59,14 @@
           "output_excerpt": {
             "type": "string",
             "description": "The lines that decide the result, copied verbatim."
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "How many times this was run. Above 1, `retry_reason` must say what differed between attempts."
+          },
+          "retry_reason": {
+            "type": "string"
           }
         }
       }

@@ -94,6 +94,33 @@ could not tell success from failure — which is why the port adds `isError` and
 `structuredContent`. Briefing our own agents in prose was the identical mistake,
 one layer up.
 
+## The escape clause
+
+Every brief carries `max_attempts`, defaulting to **1**, and exactly one
+`on_exhausted` option: **report and stop**.
+
+One, not three, because a build or test failure is deterministic — running it
+again tells you nothing you did not already know. A retry earns its place only
+when something can genuinely differ between attempts, and the brief has to say
+what (`retry_only_if`): a process that died before any test body ran, a network
+call that can time out. Absent that, a second attempt is a loop wearing
+persistence as a disguise.
+
+The rule that matters is what happens when attempts run out, and it is why
+`on_exhausted` has only one value. **Trying something the brief did not
+authorise is never the escape.** An agent with no sanctioned way out of a
+blocker will invent one, and inventing one is exactly how SQLite 3.45.1 ended up
+standing in for a pinned 3.50.4. Reporting `job: "could_not"` with the evidence
+has to be an obviously acceptable outcome, or the agent will treat it as failure
+and route around it.
+
+### Three strikes, on the task rather than the agent
+
+Same rule one level up. If an agent has to be re-briefed three times for the
+same task, stop re-briefing. The third failure is evidence the task shape is
+wrong — too vague, too large, or needing judgement a cheap model does not have —
+not that the agent needs telling again. Take it in-house or split it.
+
 ## Why the rules are this specific
 
 An agent asked to run `make test` hit a blocked download: the suite fetches a

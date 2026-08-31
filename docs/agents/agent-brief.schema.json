@@ -79,6 +79,23 @@
           }
         }
       }
+    },
+    "max_attempts": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "How many times a command may be run before giving up. Default 1: a build or test failure is deterministic, so a second identical run tells you nothing. Raise it above 1 only for something genuinely non-deterministic, and say in `retry_only_if` what must differ between attempts."
+    },
+    "retry_only_if": {
+      "type": "string",
+      "description": "The condition that makes a retry meaningful - e.g. 'the process died before any test body ran'. Absent this, do not retry."
+    },
+    "on_exhausted": {
+      "enum": [
+        "report_and_stop"
+      ],
+      "default": "report_and_stop",
+      "description": "What to do when attempts run out. There is exactly one option on purpose. Trying something the brief did not authorise is never the escape, and an agent that has no sanctioned way out of a blocker will invent one - that is how a substituted dependency gets into a build."
     }
   }
 }
