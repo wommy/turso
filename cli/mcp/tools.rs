@@ -140,7 +140,7 @@ says so, so add LIMIT/OFFSET or an aggregate instead of relying on a bigger cap.
                         "items": {
                             "type": "array",
                             "items": {
-                                "description": "NULL, a number, a string (a non-finite float - \"inf\", \"-inf\", \"NaN\" - comes through as a string too, since JSON has no such numbers), or {\"blob\": \"<hex>\"}"
+                                "description": "NULL, a number (an integer outside plus-or-minus 2^53-1 is sent exactly but some JSON-based clients, e.g. plain JavaScript JSON.parse, will round it), a string (a non-finite float - \"inf\", \"-inf\", \"NaN\" - comes through as a string too, since JSON has no such numbers), or {\"blob\": \"<hex>\"} for a blob up to 1024 bytes. A TEXT or BLOB value over 1024 bytes comes back as a shortened stand-in instead: {\"text\": \"<first 1024 bytes>\", \"bytes\": <total>, \"truncated\": true} or {\"blob_preview\": \"<hex of first 32 bytes>\", \"bytes\": <total>, \"truncated\": true}. Neither is the real value - page through a large one with substr(col, offset, length), or hex(substr(col, offset, length)) for a blob, instead of relying on the preview."
                             }
                         }
                     },
@@ -179,8 +179,17 @@ says so, so add LIMIT/OFFSET or an aggregate instead of relying on a bigger cap.
         tool(
             "open_database",
             "Open database",
-            "Open or create a database file, creating parent directories if needed. Reports \
-whether the file already existed via `created` in the structured result.",
+            &if readonly {
+                "Open an existing database file, or ':memory:' for a fresh in-memory database. \
+This server was started with --readonly: it can only open a file that already exists, \
+never creates a new file or parent directory, and the connection is always read-only no \
+matter what the path asks for."
+                    .to_string()
+            } else {
+                "Open or create a database file, creating parent directories if needed. Reports \
+whether the file already existed via `created` in the structured result."
+                    .to_string()
+            },
             json!({
                 "type": "object",
                 "properties": {
@@ -208,8 +217,9 @@ whether the file already existed via `created` in the structured result.",
             "schema_change",
             "Change schema",
             &write_note(
-                "Run a single schema statement per call: CREATE/ALTER/DROP TABLE, INDEX, \
-VIEW, TRIGGER, or virtual table."
+                "Run a single schema statement per call: CREATE/ALTER/DROP for TABLE, INDEX, \
+VIEW, TRIGGER, or a virtual table; CREATE/DROP SEQUENCE; and, only when the matching \
+--experimental-* flag was passed to the server, MATERIALIZED VIEW, TYPE, or DOMAIN."
             ),
             query_schema("The schema modification statement to execute"),
             json!({
@@ -258,8 +268,13 @@ fn tool(
         "annotations": {
             "title": title,
             "readOnlyHint": read_only,
+            // A read never changes the database, so calling it again with the
+            // same arguments has no additional effect - which is exactly what
+            // this hint promises. A write's repeat effect depends on the SQL
+            // sent (a second identical INSERT adds a second row), so it stays
+            // false.
+            "idempotentHint": read_only,
             "destructiveHint": destructive,
-            "idempotentHint": false,
             "openWorldHint": false
         }
     })
@@ -509,7 +524,10 @@ impl TursoMcpServer {
     fn open_database(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
         let path = string_arg(arguments, "path")?.to_string();
 
-        if path != ":memory:" {
+        // A readonly server must not touch the filesystem before it even
+        // knows whether the open will succeed - not even to create a
+        // directory for an open that is about to fail anyway.
+        if !self.readonly && path != ":memory:" {
             let db_path = PathBuf::from(&path);
             if let Some(parent) = db_path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -524,9 +542,17 @@ impl TursoMcpServer {
         // is what creates it.
         let created = path == ":memory:" || !Path::new(&path).exists();
 
-        let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
+        // `Connection::from_uri` picks its open mode from the path itself (a
+        // `file:...?mode=` query parameter, or read-write-create by default
+        // for everything else, including a plain filename that happens to
+        // contain a `?` or `&`) and never looks at `self.readonly`. So under
+        // `--readonly` every path except the literal `:memory:` must go
+        // through the flags-controlled branch below instead, which forces
+        // `OpenFlags::ReadOnly` no matter what the path says.
+        let conn = if path == ":memory:" || (!self.readonly && path.contains([':', '?', '&', '#']))
+        {
             Connection::from_uri(&path, self.db_opts, Arc::new(SqliteDialect))
-                .map_err(|e| format!("Failed to open database '{path}': {e}"))?
+                .map_err(|e| self.open_database_error(&path, e))?
                 .1
         } else {
             let flags = if self.readonly {
@@ -542,7 +568,7 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             )
-            .map_err(|e| format!("Failed to open database '{path}': {e}"))?;
+            .map_err(|e| self.open_database_error(&path, e))?;
             db.connect()
                 .map_err(|e| format!("Failed to connect to database '{path}': {e}"))?
         };
@@ -564,6 +590,22 @@ impl TursoMcpServer {
             message,
             json!({ "path": path, "created": created }),
         ))
+    }
+
+    /// A bare I/O error ("entity not found") reads like a typo'd path, so
+    /// under `--readonly` name the real constraint the same way
+    /// `require_writable` does for the other write tools: only an existing
+    /// file can be opened, and nothing is ever created on disk.
+    fn open_database_error(&self, path: &str, e: impl std::fmt::Display) -> String {
+        if self.readonly {
+            format!(
+                "Failed to open database '{path}': {e}. This server was started with \
+--readonly: open_database can only open an existing database file read-only; it never \
+creates a new file or directory."
+            )
+        } else {
+            format!("Failed to open database '{path}': {e}")
+        }
     }
 
     fn schema_change(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
@@ -679,6 +721,14 @@ fn json_value(value: &DbValue) -> Value {
 /// Text and json representation of one query result cell, with long values
 /// cut down so one giant value can't blow out memory or context the way too
 /// many rows can (see `DEFAULT_MAX_ROWS`).
+///
+/// A truncated TEXT or BLOB always comes back as an object carrying
+/// `"truncated": true`, using a key ("text" / "blob_preview") that a
+/// full-value cell never uses, so a model can tell the two apart by shape
+/// alone instead of pattern-matching on the human-readable text. The preview
+/// is not the real value - it is only ever a prefix - so it deliberately does
+/// not reuse the `"blob"` key an untruncated blob returns, to avoid a model
+/// mistaking it for the whole thing and writing it back with e.g. `INSERT`.
 fn display_cell(value: &DbValue) -> (String, Value) {
     match value {
         DbValue::Text(text) => {
@@ -686,12 +736,10 @@ fn display_cell(value: &DbValue) -> (String, Value) {
             if s.len() <= MAX_VALUE_BYTES {
                 (s.to_string(), json!(s))
             } else {
-                let shown = format!(
-                    "{}... [truncated, {} bytes total]",
-                    truncate_str(s, MAX_VALUE_BYTES),
-                    s.len()
-                );
-                (shown.clone(), json!(shown))
+                let truncated = truncate_str(s, MAX_VALUE_BYTES);
+                let shown = format!("{truncated}... [truncated, {} bytes total]", s.len());
+                let json = json!({ "text": truncated, "bytes": s.len(), "truncated": true });
+                (shown, json)
             }
         }
         DbValue::Blob(blob) => {
@@ -704,7 +752,8 @@ fn display_cell(value: &DbValue) -> (String, Value) {
             } else {
                 let preview = hex::encode(&blob[..BLOB_PREVIEW_BYTES.min(blob.len())]);
                 let text = format!("<blob {} bytes: {preview}...>", blob.len());
-                let json = json!({ "blob": preview, "bytes": blob.len(), "truncated": true });
+                let json =
+                    json!({ "blob_preview": preview, "bytes": blob.len(), "truncated": true });
                 (text, json)
             }
         }
@@ -1174,12 +1223,49 @@ mod tests {
 
         let result = call(&server, "execute_query", "SELECT t FROM big").expect("valid query");
 
-        let text_value = result.structured["rows"][0][0].as_str().unwrap();
-        assert!(
-            text_value.len() < 2000,
-            "value was not truncated: {text_value}"
+        let cell = &result.structured["rows"][0][0];
+        assert_eq!(cell["truncated"], true);
+        assert_eq!(cell["bytes"], 2000);
+        let text = cell["text"]
+            .as_str()
+            .expect("a truncated cell carries a text preview");
+        assert!(text.len() < 2000, "value was not truncated: {text}");
+        assert_eq!(
+            text,
+            &long_value[..text.len()],
+            "the preview must be a real prefix"
         );
-        assert!(text_value.contains("truncated, 2000 bytes total"));
+    }
+
+    #[test]
+    fn execute_query_truncates_long_blob_values_with_a_distinct_shape() {
+        let server = memory_server();
+        call(&server, "schema_change", "CREATE TABLE big (b BLOB)").unwrap();
+        let long_blob: Vec<u8> = (0..2000u32).map(|n| (n % 256) as u8).collect();
+        server
+            .call_tool(
+                "insert_data",
+                &Some(json!({
+                    "query": format!("INSERT INTO big VALUES (X'{}')", hex::encode(&long_blob))
+                })),
+            )
+            .unwrap()
+            .unwrap();
+
+        let result = call(&server, "execute_query", "SELECT b FROM big").expect("valid query");
+
+        let cell = &result.structured["rows"][0][0];
+        assert_eq!(cell["truncated"], true);
+        assert_eq!(cell["bytes"], 2000);
+        // A truncated blob is not reversible, so it must never appear under the
+        // same "blob" key a full, reversible blob uses - a model that always
+        // does `bytes.fromhex(cell["blob"])` must not be able to mistake this
+        // preview for the real value.
+        assert!(cell.get("blob").is_none(), "{cell}");
+        let preview = cell["blob_preview"]
+            .as_str()
+            .expect("a truncated blob carries a hex preview");
+        assert_eq!(preview, hex::encode(&long_blob[..BLOB_PREVIEW_BYTES]));
     }
 
     #[test]
@@ -1293,6 +1379,56 @@ mod tests {
     }
 
     #[test]
+    fn readonly_server_never_opens_a_writable_connection_via_a_uri_like_path() {
+        use super::super::readonly_memory_server;
+        let server = readonly_memory_server();
+        let dir = tempfile::tempdir().unwrap();
+        let sneaky_dir = dir.path().join("sneaky_dir");
+        let path = sneaky_dir.join("newdb_via_uri.db?mode=rwc");
+
+        let result = server
+            .call_tool(
+                "open_database",
+                &Some(json!({ "path": path.to_string_lossy() })),
+            )
+            .expect("the tool exists");
+
+        assert!(
+            result.is_err(),
+            "a URI-like path must not open a writable connection under --readonly: {result:?}"
+        );
+        assert!(
+            !sneaky_dir.exists(),
+            "opening under --readonly must not create any directory on disk, even via a URI-like path"
+        );
+    }
+
+    #[test]
+    fn readonly_server_never_creates_parent_directories() {
+        use super::super::readonly_memory_server;
+        let server = readonly_memory_server();
+        let dir = tempfile::tempdir().unwrap();
+        let plain_dir = dir.path().join("plain_dir");
+        let path = plain_dir.join("newdb.db");
+
+        let result = server
+            .call_tool(
+                "open_database",
+                &Some(json!({ "path": path.to_string_lossy() })),
+            )
+            .expect("the tool exists");
+
+        assert!(
+            result.is_err(),
+            "opening a missing file under --readonly must fail: {result:?}"
+        );
+        assert!(
+            !plain_dir.exists(),
+            "a readonly server must not create parent directories on disk, even when the open then fails"
+        );
+    }
+
+    #[test]
     fn insert_data_is_marked_destructive() {
         let catalog = catalog(false);
         let insert = catalog
@@ -1322,5 +1458,60 @@ mod tests {
                 .contains("--readonly"),
             "{insert}"
         );
+    }
+
+    #[test]
+    fn readonly_catalog_says_open_database_only_opens_existing_files() {
+        let catalog = catalog(true);
+        let open_database = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "open_database")
+            .unwrap();
+
+        assert!(
+            open_database["description"]
+                .as_str()
+                .unwrap()
+                .contains("--readonly"),
+            "{open_database}"
+        );
+    }
+
+    #[test]
+    fn pure_reads_are_marked_idempotent_and_writes_are_not() {
+        let catalog = catalog(false);
+        let hint = |name: &str| -> bool {
+            catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["annotations"]["idempotentHint"]
+                .as_bool()
+                .unwrap()
+        };
+
+        for read_only in [
+            "current_database",
+            "list_tables",
+            "describe_table",
+            "execute_query",
+        ] {
+            assert!(
+                hint(read_only),
+                "{read_only} should be idempotentHint: true"
+            );
+        }
+        for write in [
+            "open_database",
+            "insert_data",
+            "update_data",
+            "delete_data",
+            "schema_change",
+        ] {
+            assert!(!hint(write), "{write} should be idempotentHint: false");
+        }
     }
 }

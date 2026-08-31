@@ -38,7 +38,9 @@ The server honors every database option the CLI itself was started with — `--r
 switches to a different file. Start with `--readonly` (`tursodb prod.db --readonly --mcp`)
 to give a model read access only: `insert_data`, `update_data`, `delete_data`, and
 `schema_change` all fail with a message naming `--readonly` as the reason, no matter which
-database is open at the time.
+database is open at the time, and `open_database` itself can then only open a file that
+already exists — it never creates a new file or directory, and the connection is always
+read-only regardless of what the path says.
 
 The HTTP transport serves a single endpoint, `POST /mcp`. It rejects requests whose
 `Origin` is not localhost, so a web page cannot reach your databases through DNS
@@ -73,6 +75,11 @@ Every tool declares an output schema and returns `structuredContent` alongside t
 readable text, so a client can consume results without parsing the text table. A failed
 call comes back as a result with `isError: true`, not as a JSON-RPC error.
 
+`current_database`, `list_tables`, `describe_table`, and `execute_query` are marked
+`idempotentHint: true`: none of them changes the database, so calling one again with the
+same arguments has no additional effect. The five tools that can write are marked
+`idempotentHint: false`.
+
 ### `open_database`
 
 Open or create a database file, creating parent directories if needed.
@@ -83,6 +90,12 @@ Structured result: `path` and `created` — `created` is `true` when the file di
 before this call (or the path is `:memory:`) and `false` when an existing file was opened.
 The text result says which: "Created new empty database at ..." or "Opened existing
 database ...". This is how a typo'd path is told apart from a real, populated database.
+
+Under `--readonly`, `open_database` can only open a file that already exists: it never
+creates a new file or a parent directory, and the connection is always read-only no matter
+what the path itself asks for (a path with `?`, `&`, `#`, or a `mode=` query parameter does
+not escape this). A failed open under `--readonly` names `--readonly` as the reason, the
+same way the other write tools do.
 
 ### `current_database`
 
@@ -107,12 +120,21 @@ Run a single SELECT, EXPLAIN, or EXPLAIN QUERY PLAN statement.
 - `max_rows` (integer, optional): caps how many rows come back. Defaults to 200.
 
 Structured result: `columns`, `rows`, `row_count` and `truncated`. Values keep their SQL
-types; a blob appears as `{"blob": "<hex>"}`. Once a value passes 1 KiB it is shortened —
-text gets a `... [truncated, N bytes total]` suffix, and a blob's hex is cut to a short
-prefix plus its byte count — so one huge value cannot blow out memory or context. When more
-rows exist than `max_rows` allowed, `truncated` is `true` and the text result ends with a
-line telling the model to add `LIMIT`/`OFFSET` or an aggregate instead of raising the cap
-indefinitely.
+types; a blob up to 1 KiB appears as `{"blob": "<hex>"}`. An integer outside
+±2^53−1 is sent exactly, but some JSON-based clients (plain JavaScript `JSON.parse`, for
+one) will silently round it on the way in — treat an ID or rowid that large with
+suspicion if it later fails to match a row.
+
+Once a TEXT or BLOB value passes 1 KiB, the cell comes back as a shortened stand-in
+instead of the real value, and `truncated: true` on that stand-in is how a program tells
+it apart from a full value: `{"text": "<first 1024 bytes>", "bytes": N, "truncated":
+true}`, or `{"blob_preview": "<hex of first 32 bytes>", "bytes": N, "truncated": true}`.
+Neither is reversible — page through a large value with `substr(col, offset, length)` (or
+`hex(substr(col, offset, length))` for a blob) instead of relying on the preview.
+
+When more rows exist than `max_rows` allowed, `truncated` is `true` and the text result
+ends with a line telling the model to add `LIMIT`/`OFFSET` or an aggregate instead of
+raising the cap indefinitely.
 
 The full schema — tables, indexes, views, and triggers — is available without a dedicated
 tool: `SELECT name, sql FROM sqlite_schema`.
@@ -133,8 +155,9 @@ existing rows, not just add new ones.
 
 ### `schema_change`
 
-Run a single schema statement: CREATE/ALTER/DROP TABLE, INDEX, VIEW, TRIGGER, or a virtual
-table.
+Run a single schema statement: CREATE/ALTER/DROP for TABLE, INDEX, VIEW, TRIGGER, or a
+virtual table; CREATE/DROP SEQUENCE; and, only when the matching `--experimental-*` flag
+was passed to the server, MATERIALIZED VIEW, TYPE, or DOMAIN.
 
 - `query` (string, required)
 
@@ -144,7 +167,8 @@ sent to `execute_query`, say) gets an error naming the right tool to use instead
 BEGIN/COMMIT, ATTACH, and VACUUM are not available in any tool.
 
 When the server was started with `--readonly`, `insert_data`, `update_data`, `delete_data`,
-and `schema_change` all fail immediately, and their catalog descriptions say so.
+and `schema_change` all fail immediately, and their catalog descriptions say so. See
+`open_database` above for how `--readonly` changes that tool instead of disabling it.
 
 ## Integration with AI Assistants
 

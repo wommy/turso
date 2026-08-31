@@ -164,7 +164,8 @@ impl TursoMcpServer {
         let instructions = if self.readonly {
             format!(
                 "{INSTRUCTIONS} This server was started with --readonly: insert_data, \
-update_data, delete_data and schema_change are unavailable."
+update_data, delete_data and schema_change are unavailable, and open_database can only \
+open an existing file read-only (it never creates a new file or directory)."
             )
         } else {
             INSTRUCTIONS.to_string()
