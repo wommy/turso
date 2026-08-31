@@ -94,6 +94,44 @@ could not tell success from failure — which is why the port adds `isError` and
 `structuredContent`. Briefing our own agents in prose was the identical mistake,
 one layer up.
 
+## Negative proof has to isolate the test
+
+Requiring a negative proof is not enough — how it is run decides whether it means
+anything.
+
+**Isolate each test.** Tests share a module, so if one fails to compile against
+the pre-fix code, the whole test binary fails and every test in it reports
+`did_not_compile`. That result says nothing about whether any individual test has
+teeth; it only says a neighbour broke the build. Copy across only the tests that
+can compile against the old code, and check the rest separately.
+
+This is not hypothetical. A verification agent reported all five new tests as
+`did_not_compile` and concluded from it that all five "depend on the fix". Two of
+them touched nothing that changed signature and should have compiled and run.
+When they were isolated and run properly, one of them **passed without the fix** —
+a test that proved nothing, sitting in a branch about to be sent upstream.
+
+**A test that passes without the fix is a finding to report immediately**, not a
+line item. It is the single most valuable thing a negative proof can turn up,
+because it is invisible everywhere else: the suite is green, the reviewer sees a
+test named after the bug, and nothing is actually guarded.
+
+The defect in that case was ordinary. The test padded an HTTP header to 40 KiB
+against a 32 KiB cap — so far past it that the *old* check caught it on an
+earlier read, before the terminator arrived, and the overshoot the fix addresses
+was never exercised. Sized to 33 KiB it fails without the fix and passes with it.
+A test can be wrong by being too extreme, not only too weak.
+
+## Test both directions
+
+A guard needs a test that it rejects the bad input **and** a test that it still
+accepts the good input. Only the first is usually written, and on its own it
+cannot tell a working guard from one that rejects everything.
+
+Concretely: the fix rejects `Content-Length` headers that disagree. A test that
+repeated but *identical* headers are still accepted is what stops an
+over-eager guard — one that refuses any repeat at all — from passing the suite.
+
 ## The escape clause
 
 Every brief carries `max_attempts`, defaulting to **1**, and exactly one
