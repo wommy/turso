@@ -167,3 +167,30 @@ specific bug with a reference.
 ## CI Note
 
 Running in GitHub Action? Max-turns limit in `.github/workflows/claude.yml`. OK to push WIP and continue in another action. Stay focused, avoid rabbit holes.
+
+## Agent skills
+
+Config for Matt Pocock's engineering skills (`github.com/mattpocock/skills`):
+`/grill-with-docs`, `/to-spec`, `/to-tickets`, `/implement`, `/tdd`,
+`/code-review`. Written by `/setup-matt-pocock-skills`.
+
+This branch is **not for upstream**. It exists so the config is durable and
+reviewable somewhere, without putting it in a pull request that Turso is meant
+to take. See `docs/adr/0001-agent-config-lives-on-its-own-branch.md`.
+
+### Issue tracker
+
+GitHub issues on this fork, reached through `gh` locally or the `mcp__github__*`
+tools in a remote container; `.scratch/` holds drafts nobody else needs yet.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Not configured — the `triage` skill is not installed. Re-run
+`/setup-matt-pocock-skills` if it ever is.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` and `docs/adr/`, with the read list
+pointing at the per-area guides already in `docs/agent-guides/`. See
+`docs/agents/domain.md`.
