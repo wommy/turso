@@ -82,6 +82,12 @@ pub struct Opts {
     pub mcp: bool,
     #[clap(
         long,
+        value_name = "ADDR",
+        help = "Start MCP server over Streamable HTTP at given address (e.g. 127.0.0.1:8081)"
+    )]
+    pub mcp_http: Option<String>,
+    #[clap(
+        long,
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
@@ -446,7 +452,7 @@ impl Limbo {
     }
 
     pub fn is_mcp_mode(&self) -> bool {
-        self.opts.mcp
+        self.opts.mcp || self.opts.mcp_http_address.is_some()
     }
 
     pub fn is_sync_server_mode(&self) -> bool {

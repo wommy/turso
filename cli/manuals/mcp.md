@@ -6,86 +6,113 @@ display_name: "a built-in MCP server"
 
 ## Overview
 
-Turso includes a built-in MCP (Model Context Protocol) server that allows AI assistants and other tools to interact with your databases programmatically.
+Turso includes a built-in MCP (Model Context Protocol) server that lets AI assistants and
+other tools work with your databases programmatically.
+
+The server speaks MCP **2026-07-28** ("v2"), and still answers the older `initialize`
+handshake used by revisions 2025-06-18, 2025-03-26 and 2024-11-05, so clients that have
+not moved to v2 keep working.
 
 ## Starting the MCP Server
 
-To start Turso in MCP server mode, use the `--mcp` flag:
+Over stdio, which is what desktop clients launch:
 
 ```bash
 /path/to/tursodb --mcp
 ```
 
-This will start an MCP server that listens on stdio for commands. The server starts without a database connection, allowing you to select or create databases using MCP commands.
+Over Streamable HTTP:
+
+```bash
+/path/to/tursodb --mcp-http 127.0.0.1:8081
+```
+
+Both start without a database connection, so you pick or create one with the
+`open_database` tool. Pass a database file (`tursodb mydata.db --mcp`) to start with one
+already open.
+
+The HTTP transport serves a single endpoint, `POST /mcp`. It rejects requests whose
+`Origin` is not localhost, so a web page cannot reach your databases through DNS
+rebinding. Bind it to a loopback address unless you know you want it exposed.
+
+## Discovery
+
+A v2 client sends no handshake. It may call `server/discover` to learn what the server
+supports:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "server/discover",
+  "params": {
+    "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+  }
+}
+```
+
+The reply lists the protocol versions the server speaks, its capabilities (tools only) and
+how long the tool list may be cached.
 
 ## Available Tools
 
-The MCP server exposes the following tools:
+Every tool declares an output schema and returns `structuredContent` alongside the human
+readable text, so a client can consume results without parsing the text table. A failed
+call comes back as a result with `isError: true`, not as a JSON-RPC error.
 
-### `query`
-Execute a SQL query and get results.
+### `open_database`
 
-**Parameters:**
-- `sql` (string, required): The SQL query to execute
+Open or create a database file, creating parent directories if needed.
 
-**Example:**
-```json
-{
-  "tool": "query",
-  "arguments": {
-    "sql": "SELECT * FROM users WHERE age > 21"
-  }
-}
-```
+- `path` (string, required): path to the database file, or `:memory:`.
 
-### `execute`
-Execute a SQL statement that modifies data (INSERT, UPDATE, DELETE).
+### `current_database`
 
-**Parameters:**
-- `sql` (string, required): The SQL statement to execute
-
-**Example:**
-```json
-{
-  "tool": "execute",
-  "arguments": {
-    "sql": "INSERT INTO users (name, age) VALUES ('Alice', 30)"
-  }
-}
-```
+Report the path of the currently open database. Takes no arguments.
 
 ### `list_tables`
-List all tables in the database.
 
-**Example:**
-```json
-{
-  "tool": "list_tables",
-  "arguments": {}
-}
-```
+List the tables in the database. Takes no arguments.
 
 ### `describe_table`
-Get the schema of a specific table.
 
-**Parameters:**
-- `table` (string, required): The name of the table to describe
+Describe the columns of one table, including generated columns.
 
-**Example:**
+- `table_name` (string, required)
+
+### `execute_query`
+
+Run a single read-only SELECT.
+
+- `query` (string, required)
+
+Structured result: `columns`, `rows` and `row_count`. Values keep their SQL types; a blob
+appears as `{"blob": "<hex>"}`.
+
 ```json
 {
-  "tool": "describe_table",
-  "arguments": {
-    "table": "users"
-  }
+  "name": "execute_query",
+  "arguments": { "query": "SELECT * FROM users WHERE age > 21" }
 }
 ```
+
+### `insert_data`, `update_data`, `delete_data`
+
+Run a single INSERT, UPDATE or DELETE. Each takes a `query` (string, required) and reports
+`changes`, the number of rows changed.
+
+### `schema_change`
+
+Run a single CREATE, ALTER or DROP statement.
+
+- `query` (string, required)
+
+Each tool accepts exactly one statement of its own kind. `UPDATE t SET x=1; DROP TABLE t`
+is rejected, and nothing runs.
 
 ## Integration with AI Assistants
 
 ### Claude Desktop
-
-To use with Claude Desktop, add the following to your Claude Desktop configuration:
 
 ```json
 {
@@ -98,15 +125,14 @@ To use with Claude Desktop, add the following to your Claude Desktop configurati
 }
 ```
 
-Note: You must use the full path to the tursodb executable as Claude Desktop may not recognize items in your PATH.
+Use the full path to the tursodb executable; Claude Desktop may not search your PATH.
 
 ### Other MCP Clients
 
-The Turso MCP server follows the standard MCP protocol and can be used with any MCP-compatible client.
+Any MCP client works. A client that speaks a pre-2026 revision handshakes with
+`initialize` as before; a v2 client just starts calling.
 
 ## Example Session
-
-Here's an example of using the MCP server:
 
 1. **Start the server:**
    ```bash
@@ -119,13 +145,13 @@ Here's an example of using the MCP server:
    [Uses list_tables tool]
 
    > Show me all users older than 25
-   [Uses query tool with "SELECT * FROM users WHERE age > 25"]
+   [Uses execute_query tool with "SELECT * FROM users WHERE age > 25"]
    ```
 
 3. **Modify data:**
    ```
    > Add a new user named Bob who is 28 years old
-   [Uses execute tool with INSERT statement]
+   [Uses insert_data tool with an INSERT statement]
    ```
 
 ## Troubleshooting
@@ -137,7 +163,12 @@ Here's an example of using the MCP server:
 ### Commands fail
 - Verify SQL syntax is correct
 - Check that tables and columns exist
+- Send one statement per call
 - Ensure you have write permissions if modifying data
+
+### HTTP requests are rejected
+- Every POST needs `MCP-Protocol-Version` and `Mcp-Method`; `tools/call` also needs `Mcp-Name`. They must match the body, or the server answers 400 with error `-32020`.
+- A non-localhost `Origin` gets 403.
 
 ## See Also
 

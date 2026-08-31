@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,6 +12,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
+use crate::http::{cors_headers, format_http_response, read_http_request, HttpResponse};
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
@@ -37,7 +38,6 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
-const MAX_HEADER_BYTES: usize = 32 * 1024;
 
 pub struct TursoSyncServer {
     address: String,
@@ -114,50 +114,12 @@ impl TursoSyncServer {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-        let mut buffer = [0u8; 8192];
-        let mut request_data = Vec::new();
-
-        loop {
-            let n = stream.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            // Bytes before this offset hold no terminator, and one can still
-            // straddle the last three of them.
-            let unscanned = request_data.len().saturating_sub(3);
-            request_data.extend_from_slice(&buffer[..n]);
-
-            let Some(header_end) = find_header_end(&request_data, unscanned) else {
-                if request_data.len() > MAX_HEADER_BYTES {
-                    return Err(anyhow!(
-                        "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
-                    ));
-                }
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request_data[..header_end]);
-            if let Some(content_length) = parse_content_length(&headers) {
-                let total_expected = request_end(header_end, content_length)?;
-                while request_data.len() < total_expected {
-                    let n = stream.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    request_data.extend_from_slice(&buffer[..n]);
-                }
-            }
-            break;
-        }
-
-        let (method, path, body) = parse_http_request(&request_data)?;
+        let request = read_http_request(&mut stream)?;
+        let (method, path, body) = (request.method, request.path, request.body);
         info!("Request: {} {}", method, path);
 
         let response = match (method.as_str(), path.as_str()) {
-            ("OPTIONS", _) => Ok(HttpResponse {
-                status: 204,
-                content_type: "text/plain".to_string(),
-                body: Vec::new(),
-            }),
+            ("OPTIONS", _) => Ok(HttpResponse::new(204, "text/plain", Vec::new())),
             ("POST", "/v2/pipeline") => {
                 debug!("Handling /v2/pipeline request");
                 self.handle_pipeline(&body)
@@ -168,11 +130,7 @@ impl TursoSyncServer {
             }
             _ => {
                 info!("Unknown endpoint: {} {}", method, path);
-                Ok(HttpResponse {
-                    status: 404,
-                    content_type: "text/plain".to_string(),
-                    body: b"Not Found".to_vec(),
-                })
+                Ok(HttpResponse::new(404, "text/plain", b"Not Found".to_vec()))
             }
         };
 
@@ -180,14 +138,15 @@ impl TursoSyncServer {
             Ok(resp) => resp,
             Err(e) => {
                 error!("Request error: {}", e);
-                HttpResponse {
-                    status: 500,
-                    content_type: "text/plain".to_string(),
-                    body: format!("Internal Server Error: {e}").into_bytes(),
-                }
+                HttpResponse::new(
+                    500,
+                    "text/plain",
+                    format!("Internal Server Error: {e}").into_bytes(),
+                )
             }
         };
 
+        let http_response = http_response.with_headers(cors_headers());
         let response_bytes = format_http_response(&http_response);
         stream.write_all(&response_bytes)?;
         stream.flush()?;
@@ -227,11 +186,7 @@ impl TursoSyncServer {
 
         let body = serde_json::to_vec(&resp)?;
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/json".to_string(),
-            body,
-        })
+        Ok(HttpResponse::new(200, "application/json", body))
     }
 
     fn execute_statement(&self, conn: &Arc<Connection>, req: &ExecuteStreamReq) -> StreamResult {
@@ -636,11 +591,11 @@ impl TursoSyncServer {
             response_body.len()
         );
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     fn handle_logical_pull_updates(&self, req: &PullUpdatesReqProtoBody) -> Result<HttpResponse> {
@@ -756,11 +711,11 @@ impl TursoSyncServer {
             body.len()
         );
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     fn handle_logical_fallback(
@@ -800,11 +755,11 @@ impl TursoSyncServer {
         let header_bytes = header.encode_to_vec();
         encode_length_delimited(&mut response_body, &header_bytes);
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     fn handle_replace_base_pages(&self, server_revision: String) -> Result<HttpResponse> {
@@ -835,11 +790,11 @@ impl TursoSyncServer {
             encode_length_delimited(&mut response_body, &page_bytes);
         }
 
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+        Ok(HttpResponse::new(
+            200,
+            "application/protobuf",
+            response_body,
+        ))
     }
 
     #[allow(clippy::type_complexity)]
@@ -869,12 +824,6 @@ impl TursoSyncServer {
 
         Ok((db_size, pages))
     }
-}
-
-struct HttpResponse {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
 }
 
 struct MvccLogSnapshot {
@@ -1144,78 +1093,6 @@ fn db_size_from_page(page: &[u8]) -> u32 {
 
 /// A client controls Content-Length, so the end of the body has to be
 /// computed without trusting it to fit.
-fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
-    (header_end + 4)
-        .checked_add(content_length)
-        .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
-}
-
-fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
-    (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            let value = line.split(':').nth(1)?.trim();
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
-    let header_end = find_header_end(data, 0).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
-    let headers = String::from_utf8_lossy(&data[..header_end]);
-
-    let first_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("Empty request"))?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        return Err(anyhow!("Invalid request line"));
-    }
-
-    let method = parts[0].to_string();
-    let path = parts[1].to_string();
-    let body = data[header_end + 4..].to_vec();
-
-    Ok((method, path, body))
-}
-
-fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
-    let status_text = match resp.status {
-        200 => "OK",
-        204 => "No Content",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Unknown",
-    };
-
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         Access-Control-Expose-Headers: *\r\n\
-         \r\n",
-        resp.status,
-        status_text,
-        resp.content_type,
-        resp.body.len()
-    );
-
-    let mut result = header.into_bytes();
-    result.extend_from_slice(&resp.body);
-    result
-}
-
 fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
     let mut len = data.len();
     while len >= 0x80 {
@@ -1252,38 +1129,5 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Mirrors the read loop: the terminator must be found whatever the chunk
-    /// boundaries, including when it straddles two reads.
-    #[test]
-    fn finds_header_end_across_read_boundaries() {
-        let request = b"POST / HTTP/1.1\r\nHost: x\r\n\r\nbody".to_vec();
-        let expected = find_header_end(&request, 0).expect("terminator is present");
-
-        for chunk in 1..=request.len() {
-            let mut data = Vec::new();
-            let mut found = None;
-            for piece in request.chunks(chunk) {
-                let unscanned = data.len().saturating_sub(3);
-                data.extend_from_slice(piece);
-                if let Some(end) = find_header_end(&data, unscanned) {
-                    found = Some(end);
-                    break;
-                }
-            }
-            assert_eq!(found, Some(expected), "missed terminator at chunk {chunk}");
-        }
-    }
-
-    #[test]
-    fn rejects_content_length_that_overflows() {
-        assert!(request_end(0, usize::MAX).is_err());
-        assert_eq!(request_end(10, 5).unwrap(), 19);
     }
 }

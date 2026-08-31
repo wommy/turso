@@ -4,9 +4,10 @@ mod commands;
 mod config;
 mod dot_command;
 mod helper;
+mod http;
 mod input;
 mod manual;
-mod mcp_server;
+mod mcp;
 mod opcodes_dictionary;
 mod read_state_machine;
 mod sync_server;
@@ -15,7 +16,7 @@ mod sync_server;
 mod mvcc_repl;
 
 use config::CONFIG_DIR;
-use mcp_server::TursoMcpServer;
+use mcp::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
@@ -45,7 +46,10 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     let interrupt_count = app.get_interrupt_count();
     let mcp_server = TursoMcpServer::new(conn, interrupt_count);
 
-    mcp_server.run()
+    match app.opts.mcp_http_address.as_deref() {
+        Some(address) => mcp_server.run_http(address),
+        None => mcp_server.run_stdio(),
+    }
 }
 
 fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {

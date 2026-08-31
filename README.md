@@ -255,11 +255,20 @@ the [README.md under bindings/java](bindings/java/README.md).
 
 The Turso CLI includes a built-in [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows AI assistants to interact with your databases.
 
-Start the MCP server with:
+Start the MCP server on stdio with:
 
 ```shell
 tursodb your_database.db --mcp
 ```
+
+Or over Streamable HTTP, serving `POST /mcp`:
+
+```shell
+tursodb your_database.db --mcp-http 127.0.0.1:8081
+```
+
+The server speaks MCP 2026-07-28 and still answers the older `initialize` handshake, so
+clients on either revision work.
 
 ### Configuration
 
@@ -330,7 +339,7 @@ claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
 - **`--`** - Required separator between Claude options and your command
 - **`tursodb`** - The Turso database CLI
 - **`./path/to/your/database.db`** - Path to your SQLite database file
-- **`--mcp`** - Enables MCP server mode
+- **`--mcp`** - Enables MCP server mode on stdio (use `--mcp-http <ADDRESS>` for Streamable HTTP)
 
 #### Example Usage
 

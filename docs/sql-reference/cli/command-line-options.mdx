@@ -117,10 +117,18 @@ tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
 
 ### `--mcp`
 
-Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
+Start a Model Context Protocol server on stdio instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC. The server speaks MCP 2026-07-28 and still answers the older `initialize` handshake.
 
 ```bash
 tursodb --mcp mydata.db
+```
+
+### `--mcp-http <ADDRESS>`
+
+Start the same MCP server over Streamable HTTP, serving `POST /mcp` at the given address. Requests from a non-localhost `Origin` are refused.
+
+```bash
+tursodb --mcp-http 127.0.0.1:8081 mydata.db
 ```
 
 ### `--sync-server <ADDRESS>`
