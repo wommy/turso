@@ -1139,8 +1139,16 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
             }
             continue;
         };
+        // The terminator can arrive in the very read that also pushes the
+        // buffer past the cap, which the check above never sees because it
+        // only runs while the terminator is still missing.
+        if header_end > MAX_HEADER_BYTES {
+            return Err(anyhow!(
+                "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
+            ));
+        }
         let headers = String::from_utf8_lossy(&request_data[..header_end]);
-        if let Some(content_length) = parse_content_length(&headers) {
+        if let Some(content_length) = parse_content_length(&headers)? {
             let total_expected = request_end(header_end, content_length)?;
             while request_data.len() < total_expected {
                 let n = stream.read(&mut buffer)?;
@@ -1149,6 +1157,10 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
                 }
                 request_data.extend_from_slice(&buffer[..n]);
             }
+            // A single read can return more than this request's body - the
+            // start of the next one, say - and everything after the headers
+            // is handed on as the body, so bound it to the declared length.
+            request_data.truncate(total_expected);
         }
         break;
     }
@@ -1160,15 +1172,28 @@ fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
     (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
 }
 
-fn parse_content_length(headers: &str) -> Option<usize> {
+fn parse_content_length(headers: &str) -> Result<Option<usize>> {
+    let mut found: Option<usize> = None;
     for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            let value = line.split(':').nth(1)?.trim();
-            return value.parse().ok();
+        if !line.to_lowercase().starts_with("content-length:") {
+            continue;
         }
+        let value = line
+            .split_once(':')
+            .map(|(_, value)| value.trim())
+            .unwrap_or_default();
+        let length: usize = value
+            .parse()
+            .map_err(|_| anyhow!("Invalid Content-Length: {value}"))?;
+        // RFC 9110 6.4.1: repeated values that disagree leave the message
+        // length ambiguous, and an ambiguous length is unrecoverable - the
+        // next request's bytes would be read as this one's body.
+        if found.is_some_and(|first| first != length) {
+            return Err(anyhow!("Conflicting Content-Length headers"));
+        }
+        found = Some(length);
     }
-    None
+    Ok(found)
 }
 
 fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
@@ -1264,6 +1289,79 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value that is not a number leaves the message length unknown. Parsing
+    /// it away as "no body" is what makes that dangerous: the body then stays
+    /// in the socket and is read as the start of the next request.
+    #[test]
+    fn a_content_length_that_is_not_a_number_is_refused() {
+        assert!(parse_content_length("Content-Length: abc").is_err());
+        assert!(parse_content_length("Content-Length: ").is_err());
+        assert!(parse_content_length("Content-Length: -1").is_err());
+    }
+
+    /// RFC 9110 6.4.1: repeated values that disagree are unrecoverable.
+    #[test]
+    fn content_length_headers_that_disagree_are_refused() {
+        assert!(parse_content_length("Content-Length: 5\r\nContent-Length: 9").is_err());
+    }
+
+    /// Repeated but identical is not ambiguous, so it is allowed through.
+    #[test]
+    fn content_length_repeated_with_one_value_is_allowed() {
+        let headers = "Content-Length: 5\r\nContent-Length: 5";
+        assert_eq!(parse_content_length(headers).unwrap(), Some(5));
+        assert_eq!(parse_content_length("Host: x").unwrap(), None);
+    }
+
+    fn serve_one_request(request: Vec<u8>) -> Result<Vec<u8>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect");
+            let _ = stream.write_all(&request);
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+        let result = read_http_request(&mut stream);
+        client.join().expect("client thread does not panic");
+        result
+    }
+
+    /// The cap is checked only while the terminator is still missing, so a
+    /// request whose terminator lands in the same read that crosses the cap
+    /// used to sail past it.
+    #[test]
+    fn oversized_headers_are_refused_even_when_the_terminator_arrives_with_them() {
+        // Just past the 32 KiB cap, not far past it: the terminator has to
+        // land in the same read that first crosses the cap. Pad far enough
+        // and the old check catches it on an earlier read, before the
+        // terminator arrives, and the overshoot is never exercised.
+        let mut request = b"POST / HTTP/1.1\r\nX-Pad: ".to_vec();
+        request.extend(std::iter::repeat_n(b'a', 33 * 1024));
+        request.extend_from_slice(b"\r\n\r\n");
+
+        let error = serve_one_request(request).expect_err("headers over the cap must be refused");
+        assert!(
+            error.to_string().contains("exceed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Everything after the headers is handed on as the body, so a read that
+    /// overshoots - the next pipelined request, say - must not be carried into
+    /// this one.
+    #[test]
+    fn the_body_stops_at_the_declared_length() {
+        let request = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nHELLOEXTRA".to_vec();
+
+        let data = serve_one_request(request).expect("a well-formed request is read");
+        let (_, _, body) = parse_http_request(&data).expect("request parses");
+
+        assert_eq!(body, b"HELLO", "body must stop at Content-Length");
+    }
 
     /// Mirrors the read loop: the terminator must be found whatever the chunk
     /// boundaries, including when it straddles two reads.
