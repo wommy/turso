@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Background agent brief",
+  "description": "What a background agent is given. Every field exists to remove latitude the agent would otherwise use to make a red result look green.",
+  "type": "object",
+  "required": ["ticket", "working_directory", "commands", "forbidden", "report_path"],
+  "additionalProperties": false,
+  "properties": {
+    "ticket": { "type": "string" },
+    "working_directory": { "type": "string", "description": "The one directory this agent owns. Name any directory another agent owns under `do_not_touch`." },
+    "commands": {
+      "type": "array",
+      "description": "Run these verbatim, in order. Do not adapt them. If one cannot run, mark it blocked and continue to the next.",
+      "items": { "type": "string" }
+    },
+    "forbidden": {
+      "type": "array",
+      "description": "Name the workarounds you can foresee, not just 'be careful'. e.g. no --release, no git stash, no substituting a different version of a pinned dependency, no editing to make a test pass.",
+      "items": { "type": "string" }
+    },
+    "counts_as_a_finding": {
+      "type": "array",
+      "description": "Outcomes that must be reported rather than treated as success. e.g. a suite that skipped for a missing dependency is a finding, not a pass.",
+      "items": { "type": "string" }
+    },
+    "do_not_touch": { "type": "array", "items": { "type": "string" } },
+    "report_path": { "type": "string", "description": "Where to write the report, valid against agent-report.schema.json." },
+    "long_running": {
+      "type": "boolean",
+      "description": "If true: wait in a bounded poll loop inside one long-timeout call. Nothing will wake you - ending your turn early abandons the job."
+    }
+  }
+}

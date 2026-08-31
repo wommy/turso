@@ -33,6 +33,34 @@ wrong for anything where the correct move on a surprise is a judgement call.
   without the change. Upstream asks for this explicitly and it matters most when
   the tests were written by a model.
 
+## Structured in, structured out
+
+Do not brief in prose and do not accept a prose report. Both have schemas:
+
+- **[`agent-brief.schema.json`](./agent-brief.schema.json)** — what the agent is
+  given: the exact commands to run verbatim, the workarounds forbidden *by
+  name*, what counts as a finding, which directory it owns, and whether it must
+  wait in a bounded loop.
+- **[`agent-report.schema.json`](./agent-report.schema.json)** — what it writes
+  back: a `status`, one entry per command with its exit code and verbatim
+  failing output, plus `blockers`, `findings` and `negative_proof`.
+
+Read the report's fields, not the agent's closing summary. A summary can smooth
+over a failure; `checks[].result` cannot.
+
+The load-bearing part is that **`blocked` is a first-class status**, on both the
+report and each individual check. An agent with only `pass` and `fail` available,
+told to run something that cannot run, has no honest move left — so it invents
+one. Giving "I could not run this" a legitimate slot is what removes the
+incentive. `blockers[].workaround_considered` exists for the same reason: it is
+where a substituted dependency or a skipped suite gets *named* instead of done.
+
+This is the same argument the MCP work itself makes. The old server returned
+failures as successful results whose text happened to say "Error", so a model
+could not tell success from failure — which is why the port adds `isError` and
+`structuredContent`. Briefing our own agents in prose was the identical mistake,
+one layer up.
+
 ## Why the rules are this specific
 
 An agent asked to run `make test` hit a blocked download: the suite fetches a
