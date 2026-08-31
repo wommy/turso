@@ -92,6 +92,7 @@ pub struct Settings {
     pub mcp: bool,
     pub sync_server_address: Option<String>,
     pub stats: bool,
+    pub readonly: bool,
 }
 
 impl From<Opts> for Settings {
@@ -121,6 +122,7 @@ impl From<Opts> for Settings {
             mcp: opts.mcp,
             sync_server_address: opts.sync_server,
             stats: false,
+            readonly: opts.readonly,
         }
     }
 }

@@ -15,14 +15,19 @@ pub struct TursoMcpServer {
     pub(crate) conn: Arc<Mutex<Arc<Connection>>>,
     pub(crate) interrupt_count: Arc<AtomicUsize>,
     pub(crate) current_db_path: Arc<Mutex<Option<String>>>,
+    /// Set by `--readonly`. The connection is opened read-only either way, but
+    /// the server has to know as well: it advertises tools, and it can be asked
+    /// to open a different database.
+    pub(crate) readonly: bool,
 }
 
 impl TursoMcpServer {
-    pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+    pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>, readonly: bool) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
             current_db_path: Arc::new(Mutex::new(None)),
+            readonly,
         }
     }
 
@@ -141,7 +146,7 @@ mod tests {
         let (_io, conn) =
             Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
                 .expect("open memory database");
-        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)))
+        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), false)
     }
 
     fn answer(server: &TursoMcpServer, request: Value) -> Value {

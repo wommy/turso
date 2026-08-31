@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use turso_core::{
-    Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect, Value as DbValue,
+    Connection, Database, DatabaseOpts, LimboError, Numeric, OpenFlags, SqliteDialect,
+    Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
@@ -117,6 +118,23 @@ fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, 
     Ok(sql)
 }
 
+/// A query answers with at most this many rows unless asked for fewer. An
+/// unbounded answer is not useful to a model and can be very large.
+/// The tools `refuse_if_readonly` turns away. The catalog is amended from this
+/// same list, so what a client is told and what it is refused cannot drift.
+const REFUSED_WHEN_READONLY: [&str; 4] =
+    ["insert_data", "update_data", "delete_data", "schema_change"];
+
+/// Stops the scan once enough rows are in hand. Returned through the row
+/// callback because that is the only way to break out of it.
+const ROW_CAP_REACHED: &str = "turso-mcp: row cap reached";
+
+const DEFAULT_MAX_ROWS: usize = 1_000;
+
+/// Long values are cut short, and say so, rather than being silently shortened
+/// into something that looks whole.
+const MAX_CELL_BYTES: usize = 512;
+
 /// What a tool produces when it succeeds: prose for a person reading the
 /// client UI, and the same answer typed for a model.
 #[derive(Debug)]
@@ -134,6 +152,42 @@ impl ToolOutput {
     }
 }
 
+/// Cuts to at most `max_bytes`, landing on a character boundary. Taking a
+/// count of `char`s instead would let a multi-byte value keep several times
+/// the byte budget it is being measured against.
+fn cut_to_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let end = (0..=max_bytes)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    &text[..end]
+}
+
+/// The prose form of a cell, held to the same budget as the structured one.
+/// Capping only `structuredContent` left a 10 MB value truncated in one field
+/// and whole in the other.
+fn display_cell(value: &DbValue) -> String {
+    // Display renders NULL as an empty string, which makes it identical to an
+    // empty text value in the table. structuredContent tells them apart; the
+    // prose has to as well. `cli/app.rs` special-cases NULL for the same
+    // reason rather than trusting Display.
+    if matches!(value, DbValue::Null) {
+        return "NULL".to_string();
+    }
+    let rendered = value.to_string();
+    if rendered.len() <= MAX_CELL_BYTES {
+        return rendered;
+    }
+    format!(
+        "{}… ({} bytes)",
+        cut_to_bytes(&rendered, MAX_CELL_BYTES),
+        rendered.len()
+    )
+}
+
 /// SQL values carry types that JSON can mostly hold. Blobs are the exception:
 /// they are tagged rather than inlined, so a model cannot mistake one for text
 /// it can act on.
@@ -142,16 +196,61 @@ fn sql_value_to_json(value: &DbValue) -> Value {
         DbValue::Null => Value::Null,
         DbValue::Numeric(Numeric::Integer(n)) => json!(n),
         DbValue::Numeric(Numeric::Float(f)) => json!(f64::from(*f)),
-        DbValue::Text(text) => json!(text.to_string()),
-        DbValue::Blob(_) => json!({ "blob": value.to_string() }),
+        DbValue::Text(text) => {
+            let text = text.to_string();
+            if text.len() <= MAX_CELL_BYTES {
+                json!(text)
+            } else {
+                // A different shape, not a shorter string: a cut value must not
+                // be usable as if it were the whole one.
+                json!({
+                    "text": cut_to_bytes(&text, MAX_CELL_BYTES),
+                    "bytes": text.len(),
+                    "truncated": true,
+                })
+            }
+        }
+        DbValue::Blob(_) => {
+            let rendered = value.to_string();
+            if rendered.len() <= MAX_CELL_BYTES {
+                json!({ "blob": rendered })
+            } else {
+                json!({
+                    "blob_preview": cut_to_bytes(&rendered, MAX_CELL_BYTES),
+                    "bytes": rendered.len(),
+                    "truncated": true,
+                })
+            }
+        }
     }
 }
 
 impl TursoMcpServer {
+    /// Under --readonly the usual "failed to open" is misleading: the file may
+    /// be perfectly openable, just not by us, and not creatable at all.
+    fn open_error(&self, path: &str, e: impl std::fmt::Display) -> String {
+        if self.readonly {
+            format!(
+                "Failed to open database '{path}': {e}. This server was started with \
+                 --readonly: it can only open an existing file, read-only, and never \
+                 creates one."
+            )
+        } else {
+            format!("Failed to open database '{path}': {e}")
+        }
+    }
+
+    fn refuse_if_readonly(&self, what: &str) -> Result<(), String> {
+        if self.readonly {
+            return Err(format!(
+                "This server was started with --readonly, so {what} is not available."
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn handle_list_tools(&self, request: JsonRpcRequest) -> JsonRpcResponse {
-        JsonRpcResponse::success(
-            request.id,
-            json!({
+        let mut result = json!({
                 "resultType": "complete",
                 // The catalog cannot change while the server runs.
                 "ttlMs": CACHE_TTL_MS,
@@ -250,7 +349,7 @@ impl TursoMcpServer {
                             "idempotentHint": true,
                             "openWorldHint": false
                         },
-                        "outputSchema": { "type": "object", "properties": { "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
+                        "outputSchema": { "type": "object", "properties": { "truncated": { "type": "boolean" }, "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
                         "description": "Execute a read-only SELECT query",
                         "inputSchema": {
                             "type": "object",
@@ -258,6 +357,11 @@ impl TursoMcpServer {
                                 "query": {
                                     "type": "string",
                                     "description": "The SELECT query to execute"
+                                },
+                                "max_rows": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Stop after this many rows. Capped at 1000, which is also the default."
                                 }
                             },
                             "required": ["query"]
@@ -356,8 +460,29 @@ impl TursoMcpServer {
                         }
                     }
                 ]
-            }),
-        )
+        });
+
+        // A model should not be offered a tool it will be refused. The catalog
+        // is the only place it can learn that before spending a call.
+        if self.readonly {
+            if let Some(tools) = result["tools"].as_array_mut() {
+                for tool in tools {
+                    let name = tool["name"].as_str().unwrap_or_default();
+                    // Not `readOnlyHint == false`: open_database writes in
+                    // principle but is never refused - it opens read-only
+                    // instead - so keying off the hint marked a working tool
+                    // unavailable.
+                    if REFUSED_WHEN_READONLY.contains(&name) {
+                        let description = tool["description"].as_str().unwrap_or_default();
+                        tool["description"] = json!(format!(
+                            "{description} UNAVAILABLE: this server was started with --readonly."
+                        ));
+                    }
+                }
+            }
+        }
+
+        JsonRpcResponse::success(request.id, result)
     }
 
     pub(crate) fn handle_call_tool(&self, request: JsonRpcRequest) -> JsonRpcResponse {
@@ -440,7 +565,10 @@ impl TursoMcpServer {
             .ok_or_else(|| "Missing or invalid path parameter".to_string())?
             .to_string();
 
-        if path != ":memory:" {
+        // Creating the directory happens before the open, so under --readonly
+        // it has to be skipped as well - otherwise the flag still lets the
+        // server make directories on disk.
+        if !self.readonly && path != ":memory:" {
             if let Some(parent) = PathBuf::from(&path).parent() {
                 if !parent.exists() {
                     std::fs::create_dir_all(parent)
@@ -449,20 +577,29 @@ impl TursoMcpServer {
             }
         }
 
-        let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
+        // A URI opens with whatever the URI says, which under --readonly would
+        // be a way around the flag. Only the flags-controlled branch below can
+        // be trusted with it, so :memory: is the sole URI-shaped path allowed.
+        let uri_shaped = path.contains([':', '?', '&', '#']);
+        let conn = if path == ":memory:" || (!self.readonly && uri_shaped) {
             Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect))
-                .map_err(|e| format!("Failed to open database '{path}': {e}"))?
+                .map_err(|e| self.open_error(&path, e))?
                 .1
         } else {
+            let flags = if self.readonly {
+                OpenFlags::default().union(OpenFlags::ReadOnly)
+            } else {
+                OpenFlags::default()
+            };
             let (_io, db) = Database::open_new(
                 &path,
                 None::<&str>,
-                OpenFlags::default(),
+                flags,
                 DatabaseOpts::new().with_autovacuum(false),
                 None,
                 Arc::new(SqliteDialect),
             )
-            .map_err(|e| format!("Failed to open database '{path}': {e}"))?;
+            .map_err(|e| self.open_error(&path, e))?;
             db.connect()
                 .map_err(|e| format!("Failed to connect to database '{path}': {e}"))?
         };
@@ -605,17 +742,35 @@ impl TursoMcpServer {
             .map(|i| rows.get_column_name(i).to_string())
             .collect();
 
+        let max_rows = arguments
+            .as_ref()
+            .and_then(|args| args.get("max_rows"))
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_MAX_ROWS, |n| (n as usize).min(DEFAULT_MAX_ROWS));
+
         let mut typed: Vec<Value> = Vec::new();
         let mut rendered: Vec<Vec<String>> = Vec::new();
-        rows.run_with_row_callback(|row| {
+        let mut truncated = false;
+        let scan = rows.run_with_row_callback(|row| {
+            if typed.len() >= max_rows {
+                truncated = true;
+                // Ok(()) here would let the engine keep stepping - scanning,
+                // sorting and aggregating a whole table whose rows we then
+                // discard. Only an Err breaks the loop.
+                return Err(LimboError::InternalError(ROW_CAP_REACHED.to_string()));
+            }
             let values: Vec<&DbValue> = row.get_values().collect();
             typed.push(Value::Array(
                 values.iter().map(|v| sql_value_to_json(v)).collect(),
             ));
-            rendered.push(values.iter().map(|v| v.to_string()).collect());
+            rendered.push(values.iter().map(|v| display_cell(v)).collect());
             Ok(())
-        })
-        .map_err(|e| e.to_string())?;
+        });
+        match scan {
+            Ok(()) => {}
+            Err(LimboError::InternalError(ref message)) if message == ROW_CAP_REACHED => {}
+            Err(e) => return Err(e.to_string()),
+        }
 
         let mut text = String::new();
         if !columns.is_empty() {
@@ -634,13 +789,22 @@ impl TursoMcpServer {
         }
 
         let row_count = typed.len();
+        if truncated {
+            text.push_str(&format!("\n(truncated at {max_rows} rows)\n"));
+        }
         Ok(ToolOutput::new(
             text,
-            json!({ "columns": columns, "rows": typed, "row_count": row_count }),
+            json!({
+                "columns": columns,
+                "rows": typed,
+                "row_count": row_count,
+                "truncated": truncated,
+            }),
         ))
     }
 
     fn insert_data(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        self.refuse_if_readonly("INSERT")?;
         let query = validated_query(arguments, StmtClass::Insert)?;
 
         let conn = self.conn.lock().unwrap().clone();
@@ -654,6 +818,7 @@ impl TursoMcpServer {
     }
 
     fn update_data(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        self.refuse_if_readonly("UPDATE")?;
         let query = validated_query(arguments, StmtClass::Update)?;
 
         let conn = self.conn.lock().unwrap().clone();
@@ -667,6 +832,7 @@ impl TursoMcpServer {
     }
 
     fn delete_data(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        self.refuse_if_readonly("DELETE")?;
         let query = validated_query(arguments, StmtClass::Delete)?;
 
         let conn = self.conn.lock().unwrap().clone();
@@ -680,6 +846,7 @@ impl TursoMcpServer {
     }
 
     fn schema_change(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        self.refuse_if_readonly("schema change")?;
         let query = validated_query(arguments, StmtClass::Schema)?;
 
         let conn = self.conn.lock().unwrap().clone();
@@ -702,7 +869,7 @@ mod tests {
         let (_io, conn) =
             Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
                 .expect("open memory database");
-        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)))
+        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), false)
     }
 
     fn query_arg(sql: &str) -> Option<Value> {
@@ -969,5 +1136,273 @@ mod tests {
             );
             assert_eq!(tool["annotations"]["openWorldHint"], false);
         }
+    }
+    fn readonly_server() -> TursoMcpServer {
+        let (_io, conn) =
+            Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
+                .expect("open memory database");
+        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), true)
+    }
+
+    /// Both directions: a write is refused under --readonly, and a read is not.
+    #[test]
+    fn readonly_refuses_writes_and_still_serves_reads() {
+        let server = readonly_server();
+
+        // Every write tool, not just one: with a single sample the other
+        // three guards could be deleted and this suite would stay green.
+        for (tool, result) in [
+            (
+                "insert_data",
+                server.insert_data(&query_arg("INSERT INTO t VALUES (1)")),
+            ),
+            (
+                "update_data",
+                server.update_data(&query_arg("UPDATE t SET x=1")),
+            ),
+            (
+                "delete_data",
+                server.delete_data(&query_arg("DELETE FROM t")),
+            ),
+            (
+                "schema_change",
+                server.schema_change(&query_arg("CREATE TABLE t (x)")),
+            ),
+        ] {
+            let refused = result.expect_err("{tool} must be refused under --readonly");
+            assert!(refused.contains("--readonly"), "{tool}: {refused}");
+        }
+
+        assert!(
+            server.current_database().is_ok(),
+            "a read must still work under --readonly"
+        );
+    }
+
+    /// The flag governs the whole server, not just the connection it started
+    /// with: opening another database must not hand back a writable one.
+    #[test]
+    fn readonly_does_not_open_a_writable_connection_through_a_uri() {
+        let server = readonly_server();
+        let dir = std::env::temp_dir().join(format!("mcp-ro-{}", std::process::id()));
+
+        let result = server.open_database(&Some(json!({
+            "path": format!("file:{}/x.db?mode=rwc", dir.display()),
+        })));
+
+        assert!(result.is_err(), "a URI path must not bypass --readonly");
+        assert!(
+            !dir.exists(),
+            "--readonly must not create directories on disk"
+        );
+    }
+
+    #[test]
+    fn a_query_stops_at_the_row_cap_and_says_that_it_did() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE many (n INTEGER)"))
+            .expect("create");
+        for n in 0..5 {
+            server
+                .insert_data(&query_arg(&format!("INSERT INTO many VALUES ({n})")))
+                .expect("insert");
+        }
+
+        let capped = server
+            .execute_query(&Some(
+                json!({ "query": "SELECT n FROM many", "max_rows": 2 }),
+            ))
+            .expect("query succeeds");
+        assert_eq!(capped.structured["row_count"], 2);
+        assert_eq!(capped.structured["truncated"], true);
+        assert!(
+            capped.text.contains("truncated at 2 rows"),
+            "{}",
+            capped.text
+        );
+
+        let whole = server
+            .execute_query(&query_arg("SELECT n FROM many"))
+            .expect("query succeeds");
+        assert_eq!(whole.structured["row_count"], 5);
+        assert_eq!(
+            whole.structured["truncated"], false,
+            "an answer under the cap is not marked truncated"
+        );
+    }
+
+    /// A cut value gets a different shape, not a shorter string - otherwise it
+    /// reads as the whole value and can be acted on as if it were.
+    #[test]
+    fn an_oversized_cell_is_shaped_so_it_cannot_pass_for_the_whole_value() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE big (t TEXT)"))
+            .expect("create");
+        let long = "x".repeat(MAX_CELL_BYTES * 2);
+        server
+            .insert_data(&query_arg(&format!("INSERT INTO big VALUES ('{long}')")))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_arg("SELECT t FROM big"))
+            .expect("query succeeds");
+        let cell = &result.structured["rows"][0][0];
+
+        assert!(cell.is_object(), "a cut value must not still be a string");
+        assert_eq!(cell["truncated"], true);
+        assert_eq!(cell["bytes"], long.len());
+        assert!(cell["text"].as_str().unwrap().len() < long.len());
+    }
+
+    #[test]
+    fn the_catalog_says_which_tools_readonly_has_taken_away() {
+        let server = readonly_server();
+        let raw = server
+            .handle_message(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} })
+                    .to_string(),
+            )
+            .expect("tools/list is answered");
+        let tools = serde_json::from_str::<Value>(&raw).unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+
+        let described = |name: &str| {
+            tools.iter().find(|t| t["name"] == name).unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(described("delete_data").contains("UNAVAILABLE"));
+        assert!(
+            !described("execute_query").contains("UNAVAILABLE"),
+            "a read is still available and must not be marked otherwise"
+        );
+    }
+    /// The cap is in bytes, so the cut has to be too. Counting characters
+    /// instead let a multi-byte value keep several times its budget.
+    #[test]
+    fn a_multibyte_cell_is_cut_to_the_byte_budget_not_the_character_count() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE wide (t TEXT)"))
+            .expect("create");
+        // Three bytes per character, so a character-based cut would keep
+        // roughly three times the budget.
+        let long = "\u{4e16}".repeat(MAX_CELL_BYTES);
+        server
+            .insert_data(&query_arg(&format!("INSERT INTO wide VALUES ('{long}')")))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_arg("SELECT t FROM wide"))
+            .expect("query succeeds");
+        let cell = &result.structured["rows"][0][0];
+
+        let kept = cell["text"].as_str().expect("a cut cell keeps a prefix");
+        assert!(
+            kept.len() <= MAX_CELL_BYTES,
+            "kept {} bytes against a {MAX_CELL_BYTES} byte budget",
+            kept.len()
+        );
+        assert_eq!(
+            cell["bytes"],
+            long.len(),
+            "the reported size is the real one"
+        );
+    }
+    /// The catalog is amended from the same list the refusal uses, so the two
+    /// cannot disagree. open_database is the case that caught this: it writes
+    /// in principle, but is never refused - it opens read-only instead.
+    #[test]
+    fn the_catalog_marks_exactly_the_tools_that_are_refused() {
+        let server = readonly_server();
+        let raw = server
+            .handle_message(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} })
+                    .to_string(),
+            )
+            .expect("tools/list is answered");
+        let tools = serde_json::from_str::<Value>(&raw).unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let marked = tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("UNAVAILABLE");
+            assert_eq!(
+                marked,
+                REFUSED_WHEN_READONLY.contains(&name),
+                "{name}: marked unavailable = {marked}, actually refused = {}",
+                REFUSED_WHEN_READONLY.contains(&name)
+            );
+        }
+
+        assert!(
+            server
+                .open_database(&Some(json!({ "path": ":memory:" })))
+                .is_ok(),
+            "open_database is not refused, so it must not be marked unavailable"
+        );
+    }
+
+    /// The cap governs both representations of a value. Capping only the
+    /// structured one left a huge cell truncated in one field and whole in the
+    /// other - the same shape as the bytes/chars bug, one field over.
+    #[test]
+    fn an_oversized_cell_is_cut_in_the_text_field_too() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE big (t TEXT)"))
+            .expect("create");
+        let long = "y".repeat(MAX_CELL_BYTES * 4);
+        server
+            .insert_data(&query_arg(&format!("INSERT INTO big VALUES ('{long}')")))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_arg("SELECT t FROM big"))
+            .expect("query succeeds");
+
+        assert!(
+            result.text.len() < long.len(),
+            "the text field kept {} bytes of a {} byte value",
+            result.text.len(),
+            long.len()
+        );
+        assert!(result.text.contains("bytes)"), "{}", result.text);
+    }
+    /// Display renders NULL as an empty string, so without a placeholder a
+    /// NULL and an empty text value are the same cell in the prose table.
+    #[test]
+    fn null_and_an_empty_string_are_not_the_same_cell() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE n (a TEXT)"))
+            .expect("create");
+        server
+            .insert_data(&query_arg("INSERT INTO n VALUES (NULL), ('')"))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_arg("SELECT a FROM n"))
+            .expect("query succeeds");
+
+        assert!(result.text.contains("NULL"), "{}", result.text);
+        assert!(
+            result.structured["rows"][0][0].is_null(),
+            "the structured view keeps NULL as null"
+        );
+        assert_eq!(
+            result.structured["rows"][1][0], "",
+            "and keeps the empty string as a string"
+        );
     }
 }

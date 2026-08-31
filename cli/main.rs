@@ -43,7 +43,7 @@ pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".li
 fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     let conn = app.get_connection();
     let interrupt_count = app.get_interrupt_count();
-    let mcp_server = TursoMcpServer::new(conn, interrupt_count);
+    let mcp_server = TursoMcpServer::new(conn, interrupt_count, app.is_readonly());
 
     mcp_server.run()
 }
