@@ -1,12 +1,25 @@
-# Issue tracker: GitHub, with a local scratch layer
+# Issue tracker: local markdown for now, GitHub when enabled
 
-Issues and specs for this repo live as **GitHub issues on `wommy/turso`**. That is
-the tracker of record: anything another person has to see or act on is an issue
-there.
+> **GitHub Issues are disabled on `wommy/turso`.** GitHub disables them on forks
+> by default and nobody has turned them on, so there is no GitHub tracker to
+> write to — issue creation fails with `410 Issues has been disabled`.
+>
+> **The tracker of record is therefore `.scratch/<effort>/`**, the local-markdown
+> layout: `map.md` for a wayfinder map, `issues/NN-<slug>.md` one file per
+> ticket, blocking edges as `Blocked by:` lines, state as a `Status:` line.
+>
+> To switch to GitHub: fork **Settings → Features → Issues**. The
+> `ready-for-agent` label vocabulary already exists on the repo (see
+> `triage-labels.md`), so only the tickets need migrating. Everything below then
+> applies as written.
 
-`.scratch/` is a **working layer, not a second tracker**. Audits, spikes, draft
-tickets and in-flight notes live at `.scratch/<feature-slug>/` while they are
-still yours alone. The rule that stops it becoming a shadow tracker:
+Pull requests are unaffected and work normally — three are open. The
+`mcp__github__*` PR tools and `gh pr` both function; only *issues* are off.
+
+Once Issues are enabled, GitHub becomes the tracker of record: anything another
+person has to see or act on is an issue there, and `.scratch/` reverts to being
+the draft layer for work nobody else needs yet. The rule that keeps it from
+becoming a shadow tracker:
 
 > Anything another person must act on is promoted to a GitHub issue.
 > `.scratch/` is only ever the draft.
