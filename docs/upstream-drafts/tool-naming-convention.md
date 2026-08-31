@@ -15,16 +15,24 @@ intended convention is before assuming one.
 **The hosted server** (`mcp.turso.ai`, packaged via `tursodatabase/turso-mcp`)
 exposes:
 
-`create_database`, `delete_database`, `get_database`, `list_databases`,
-`read_database`, `write_database`, `delete_from_database`
+control-plane: `list_databases`, `get_database`, `set_database_config`,
+`create_database`, `create_branch`, `list_branches`, `delete_database`,
+`database_analytics`
+
+data-plane: `read_database`, `write_database`, `delete_from_database`,
+`evolve_schema`
+
+No name appears in both sets, so nothing breaks today by having both connected.
+The awkwardness is in the reading, not the wiring.
 
 Neither set is namespaced, and several pairs are close enough to be confusing
 without reading the descriptions: `read_database` / `write_database` against
-`execute_query` / `insert_data`, and `open_database` sitting beside
-`get_database`. Connecting both is a plausible setup — the Cloud plugin is
-published for Claude Code, and someone working on a local database may well have
-both installed — and at that point an agent sees two unprefixed sets of database
-tools with overlapping meanings.
+`execute_query` / `insert_data`, `delete_from_database` against `delete_data`,
+`evolve_schema` against `schema_change`, and `open_database` sitting beside
+`get_database` and `list_databases`. Connecting both is a plausible setup — the
+Cloud plugin is published for Claude Code, and someone working on a local
+database may well have both installed — and at that point an agent sees two
+unprefixed sets of database tools with overlapping meanings.
 
 There's a related gap in the other direction. The Cloud plugin's skill has a
 "Local / embedded Turso (recommend for local use)" section pointing at
