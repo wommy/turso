@@ -32,6 +32,13 @@ anything written there is lost when the server exits. Pass a file
 (`tursodb mydata.db --mcp`) to work on real data, or point the server at one at any time
 with the `open_database` tool.
 
+The server honors every database option the CLI itself was started with — `--readonly`,
+`--experimental-views`, and the rest — and applies the same options when `open_database`
+switches to a different file. Start with `--readonly` (`tursodb prod.db --readonly --mcp`)
+to give a model read access only: `insert_data`, `update_data`, `delete_data`, and
+`schema_change` all fail with a message naming `--readonly` as the reason, no matter which
+database is open at the time.
+
 The HTTP transport serves a single endpoint, `POST /mcp`. It rejects requests whose
 `Origin` is not localhost, so a web page cannot reach your databases through DNS
 rebinding. Bind it to a loopback address unless you know you want it exposed.
@@ -71,6 +78,11 @@ Open or create a database file, creating parent directories if needed.
 
 - `path` (string, required): path to the database file, or `:memory:`.
 
+Structured result: `path` and `created` — `created` is `true` when the file did not exist
+before this call (or the path is `:memory:`) and `false` when an existing file was opened.
+The text result says which: "Created new empty database at ..." or "Opened existing
+database ...". This is how a typo'd path is told apart from a real, populated database.
+
 ### `current_database`
 
 Report the path of the currently open database. Takes no arguments.
@@ -81,18 +93,28 @@ List the tables in the database. Takes no arguments.
 
 ### `describe_table`
 
-Describe the columns of one table, including generated columns.
+Describe the columns of one table, including generated columns. Table names are quoted
+internally, so names with spaces or reserved words (`order`, `my table`) work.
 
 - `table_name` (string, required)
 
 ### `execute_query`
 
-Run a single read-only SELECT.
+Run a single SELECT, EXPLAIN, or EXPLAIN QUERY PLAN statement.
 
 - `query` (string, required)
+- `max_rows` (integer, optional): caps how many rows come back. Defaults to 200.
 
-Structured result: `columns`, `rows` and `row_count`. Values keep their SQL types; a blob
-appears as `{"blob": "<hex>"}`.
+Structured result: `columns`, `rows`, `row_count` and `truncated`. Values keep their SQL
+types; a blob appears as `{"blob": "<hex>"}`. Once a value passes 1 KiB it is shortened —
+text gets a `... [truncated, N bytes total]` suffix, and a blob's hex is cut to a short
+prefix plus its byte count — so one huge value cannot blow out memory or context. When more
+rows exist than `max_rows` allowed, `truncated` is `true` and the text result ends with a
+line telling the model to add `LIMIT`/`OFFSET` or an aggregate instead of raising the cap
+indefinitely.
+
+The full schema — tables, indexes, views, and triggers — is available without a dedicated
+tool: `SELECT name, sql FROM sqlite_schema`.
 
 ```json
 {
@@ -104,16 +126,24 @@ appears as `{"blob": "<hex>"}`.
 ### `insert_data`, `update_data`, `delete_data`
 
 Run a single INSERT, UPDATE or DELETE. Each takes a `query` (string, required) and reports
-`changes`, the number of rows changed.
+`changes`, the number of rows changed. `insert_data` is marked `destructiveHint: true`
+because `INSERT OR REPLACE` and `ON CONFLICT ... DO UPDATE` can overwrite or delete
+existing rows, not just add new ones.
 
 ### `schema_change`
 
-Run a single CREATE, ALTER or DROP statement.
+Run a single schema statement: CREATE/ALTER/DROP TABLE, INDEX, VIEW, TRIGGER, or a virtual
+table.
 
 - `query` (string, required)
 
 Each tool accepts exactly one statement of its own kind. `UPDATE t SET x=1; DROP TABLE t`
-is rejected, and nothing runs.
+is rejected, nothing runs, and the error says so. A statement of the wrong kind (a PRAGMA
+sent to `execute_query`, say) gets an error naming the right tool to use instead; PRAGMA,
+BEGIN/COMMIT, ATTACH, and VACUUM are not available in any tool.
+
+When the server was started with `--readonly`, `insert_data`, `update_data`, `delete_data`,
+and `schema_change` all fail immediately, and their catalog descriptions say so.
 
 ## Integration with AI Assistants
 

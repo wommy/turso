@@ -463,6 +463,13 @@ impl Limbo {
         self.interrupt_count.clone()
     }
 
+    /// The `--experimental-*` feature set (and friends) this CLI was started
+    /// with, so a tool that opens another database can carry them over
+    /// instead of silently falling back to defaults.
+    pub fn get_db_opts(&self) -> turso_core::DatabaseOpts {
+        self.db_opts
+    }
+
     pub fn has_query_error(&self) -> bool {
         self.had_query_error
     }

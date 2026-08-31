@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use turso_core::Connection;
+use turso_core::{Connection, DatabaseOpts};
 
 use protocol::{
     server_info, JsonRpcError, JsonRpcRequest, JsonRpcResponse, CACHE_TTL_MS, INVALID_PARAMS,
@@ -25,20 +25,34 @@ pub struct TursoMcpServer {
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
     current_db_path: Arc<Mutex<Option<String>>>,
+    /// Applied to every database `open_database` opens, so a database opened
+    /// through the tool gets the same `--experimental-*` features as the one
+    /// the CLI started with.
+    db_opts: DatabaseOpts,
+    /// Mirrors the CLI's `--readonly` flag. Checked by every write tool so
+    /// that flag stays true no matter which database `open_database` later
+    /// points the connection at.
+    readonly: bool,
 }
 
 impl TursoMcpServer {
     /// `db_path` is the database the CLI already opened, so that
     /// `current_database` reports it instead of claiming an in-memory one.
+    /// `db_opts` and `readonly` are the same options the CLI itself was
+    /// started with, so `open_database` cannot bypass them.
     pub fn new(
         conn: Arc<Connection>,
         interrupt_count: Arc<AtomicUsize>,
         db_path: Option<String>,
+        db_opts: DatabaseOpts,
+        readonly: bool,
     ) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
             current_db_path: Arc::new(Mutex::new(db_path)),
+            db_opts,
+            readonly,
         }
     }
 
@@ -93,9 +107,9 @@ impl TursoMcpServer {
         }
 
         let response = match request.method.as_str() {
-            "server/discover" => JsonRpcResponse::success(id, discover_result()),
+            "server/discover" => JsonRpcResponse::success(id, self.discover_result()),
             "initialize" => JsonRpcResponse::success(id, initialize_result(request)),
-            "tools/list" => JsonRpcResponse::success(id, tools_list_result()),
+            "tools/list" => JsonRpcResponse::success(id, tools_list_result(self.readonly)),
             "tools/call" => self.call_tool_response(request),
             // Removed in v2, still sent by clients that speak an older revision.
             "ping" => JsonRpcResponse::success(id, json!({})),
@@ -136,22 +150,30 @@ impl TursoMcpServer {
     fn interrupted(&self) -> bool {
         self.interrupt_count.load(Ordering::SeqCst) > 0
     }
+
+    fn discover_result(&self) -> Value {
+        let instructions = if self.readonly {
+            format!(
+                "{INSTRUCTIONS} This server was started with --readonly: insert_data, \
+update_data, delete_data and schema_change are unavailable."
+            )
+        } else {
+            INSTRUCTIONS.to_string()
+        };
+        json!({
+            "resultType": "complete",
+            "supportedVersions": SUPPORTED_VERSIONS,
+            "capabilities": { "tools": {} },
+            "instructions": instructions,
+            "ttlMs": CACHE_TTL_MS,
+            "cacheScope": "public",
+            "_meta": protocol::result_meta(),
+        })
+    }
 }
 
 fn encode(response: &JsonRpcResponse) -> String {
     serde_json::to_string(response).expect("JSON-RPC responses are always serializable")
-}
-
-fn discover_result() -> Value {
-    json!({
-        "resultType": "complete",
-        "supportedVersions": SUPPORTED_VERSIONS,
-        "capabilities": { "tools": {} },
-        "instructions": INSTRUCTIONS,
-        "ttlMs": CACHE_TTL_MS,
-        "cacheScope": "public",
-        "_meta": protocol::result_meta(),
-    })
 }
 
 fn initialize_result(request: &JsonRpcRequest) -> Value {
@@ -172,10 +194,10 @@ fn initialize_result(request: &JsonRpcRequest) -> Value {
     })
 }
 
-fn tools_list_result() -> Value {
+fn tools_list_result(readonly: bool) -> Value {
     json!({
         "resultType": "complete",
-        "tools": tools::catalog(),
+        "tools": tools::catalog(readonly),
         "ttlMs": CACHE_TTL_MS,
         "cacheScope": "public",
         "_meta": protocol::result_meta(),
@@ -204,17 +226,28 @@ fn tool_result(result: Result<ToolOutput, String>) -> Value {
 
 #[cfg(test)]
 fn memory_server() -> TursoMcpServer {
-    server_on(None)
+    server_on(None, false)
 }
 
 #[cfg(test)]
-fn server_on(db_path: Option<String>) -> TursoMcpServer {
-    use turso_core::{DatabaseOpts, SqliteDialect};
+fn readonly_memory_server() -> TursoMcpServer {
+    server_on(None, true)
+}
+
+#[cfg(test)]
+fn server_on(db_path: Option<String>, readonly: bool) -> TursoMcpServer {
+    use turso_core::SqliteDialect;
 
     let (_io, conn) =
         Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
             .expect("open memory database");
-    TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), db_path)
+    TursoMcpServer::new(
+        conn,
+        Arc::new(AtomicUsize::new(0)),
+        db_path,
+        DatabaseOpts::default(),
+        readonly,
+    )
 }
 
 #[cfg(test)]
@@ -482,7 +515,7 @@ mod tests {
 
     #[test]
     fn current_database_reports_the_file_the_server_started_on() {
-        let server = server_on(Some("mydata.db".to_string()));
+        let server = server_on(Some("mydata.db".to_string()), false);
 
         let response = call(&server, "current_database", json!({}));
 

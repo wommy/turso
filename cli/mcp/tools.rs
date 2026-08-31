@@ -1,14 +1,24 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use turso_core::{
-    Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect, Value as DbValue,
-};
+use turso_core::{Connection, Database, Numeric, OpenFlags, SqliteDialect, Value as DbValue};
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
 
 use super::TursoMcpServer;
+
+/// `execute_query` stops collecting rows once it hits this many, so a `SELECT *`
+/// over a huge table cannot exhaust memory or blow out the model's context.
+const DEFAULT_MAX_ROWS: usize = 200;
+
+/// Individual cell values longer than this are cut down before they reach the
+/// model, for the same reason: one giant TEXT or BLOB value can blow out
+/// memory and context just as easily as too many rows can.
+const MAX_VALUE_BYTES: usize = 1024;
+
+/// How many raw bytes of an over-sized blob to show as a hex preview.
+const BLOB_PREVIEW_BYTES: usize = 32;
 
 #[derive(Debug)]
 pub struct ToolOutput {
@@ -26,8 +36,19 @@ impl ToolOutput {
 }
 
 /// Deterministic order: clients cache this list and prompt caches hit more often
-/// when it does not move around.
-pub fn catalog() -> Value {
+/// when it does not move around. `readonly` mirrors the server's `--readonly`
+/// flag so the write tools' descriptions say plainly that they will fail.
+pub fn catalog(readonly: bool) -> Value {
+    let write_note = |description: &str| -> String {
+        if readonly {
+            format!(
+                "{description} Unavailable: this server was started with --readonly, so writes are rejected."
+            )
+        } else {
+            description.to_string()
+        }
+    };
+
     json!([
         tool(
             "current_database",
@@ -44,7 +65,7 @@ pub fn catalog() -> Value {
         tool(
             "delete_data",
             "Delete rows",
-            "Delete data from a table",
+            &write_note("Delete rows with a single DELETE statement per call."),
             query_schema("The DELETE statement to execute"),
             changes_schema(),
             Access::Destructive,
@@ -52,7 +73,7 @@ pub fn catalog() -> Value {
         tool(
             "describe_table",
             "Describe table",
-            "Describe the structure of a specific table",
+            "Describe the columns of a specific table. Call list_tables first to find table names.",
             json!({
                 "type": "object",
                 "properties": {
@@ -90,8 +111,26 @@ pub fn catalog() -> Value {
         tool(
             "execute_query",
             "Run a SELECT query",
-            "Execute a read-only SELECT query",
-            query_schema("The SELECT query to execute"),
+            "Run one SELECT, EXPLAIN, or EXPLAIN QUERY PLAN statement per call. \
+The full schema, including indexes, views, and triggers, is available as \
+`SELECT name, sql FROM sqlite_schema`. Returns at most `max_rows` rows \
+(default 200); when more rows exist, `truncated` is set and the text output \
+says so, so add LIMIT/OFFSET or an aggregate instead of relying on a bigger cap.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The SELECT, EXPLAIN, or EXPLAIN QUERY PLAN statement to execute"
+                    },
+                    "max_rows": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of rows to return (default 200)"
+                    }
+                },
+                "required": ["query"]
+            }),
             json!({
                 "type": "object",
                 "properties": {
@@ -105,19 +144,23 @@ pub fn catalog() -> Value {
                             }
                         }
                     },
-                    "row_count": { "type": "integer" }
+                    "row_count": { "type": "integer" },
+                    "truncated": {
+                        "type": "boolean",
+                        "description": "True when more rows existed than the cap allowed"
+                    }
                 },
-                "required": ["columns", "rows", "row_count"]
+                "required": ["columns", "rows", "row_count", "truncated"]
             }),
             Access::ReadOnly,
         ),
         tool(
             "insert_data",
             "Insert rows",
-            "Insert new data into a table",
+            &write_note("Insert new rows with a single INSERT statement per call."),
             query_schema("The INSERT statement to execute"),
             changes_schema(),
-            Access::Write,
+            Access::Destructive,
         ),
         tool(
             "list_tables",
@@ -136,7 +179,8 @@ pub fn catalog() -> Value {
         tool(
             "open_database",
             "Open database",
-            "Open or create a database file. Creates parent directories if needed.",
+            "Open or create a database file, creating parent directories if needed. Reports \
+whether the file already existed via `created` in the structured result.",
             json!({
                 "type": "object",
                 "properties": {
@@ -149,15 +193,24 @@ pub fn catalog() -> Value {
             }),
             json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"]
+                "properties": {
+                    "path": { "type": "string" },
+                    "created": {
+                        "type": "boolean",
+                        "description": "True when this call created a new empty database instead of opening an existing one"
+                    }
+                },
+                "required": ["path", "created"]
             }),
             Access::Write,
         ),
         tool(
             "schema_change",
             "Change schema",
-            "Execute schema modification statements (CREATE TABLE, ALTER TABLE, DROP TABLE)",
+            &write_note(
+                "Run a single schema statement per call: CREATE/ALTER/DROP TABLE, INDEX, \
+VIEW, TRIGGER, or virtual table."
+            ),
             query_schema("The schema modification statement to execute"),
             json!({
                 "type": "object",
@@ -169,7 +222,7 @@ pub fn catalog() -> Value {
         tool(
             "update_data",
             "Update rows",
-            "Update existing data in a table",
+            &write_note("Update existing rows with a single UPDATE statement per call."),
             query_schema("The UPDATE statement to execute"),
             changes_schema(),
             Access::Destructive,
@@ -271,15 +324,17 @@ impl TursoMcpServer {
     fn describe_table(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
         let table_name = string_arg(arguments, "table_name")?;
 
-        // Use table_xinfo to include generated columns (table_info hides them)
-        let query = format!("PRAGMA table_xinfo({table_name})");
+        // Use table_xinfo to include generated columns (table_info hides them). The
+        // table name is quoted so names with spaces, quotes, or reserved words
+        // (e.g. `order`, `my table`) don't break the PRAGMA's own parsing.
+        let query = format!("PRAGMA table_xinfo({})", quote_ident(table_name));
 
         let conn = self.conn.lock().unwrap().clone();
         let Some(mut rows) = conn
             .query(&query)
             .map_err(|e| format!("Error querying database: {e}"))?
         else {
-            return Err(format!("Table '{table_name}' not found"));
+            return Err(table_not_found(table_name));
         };
 
         let mut lines = Vec::new();
@@ -337,7 +392,7 @@ impl TursoMcpServer {
         .map_err(|e| e.to_string())?;
 
         if columns.is_empty() {
-            return Err(format!("Table '{table_name}' not found"));
+            return Err(table_not_found(table_name));
         }
 
         Ok(ToolOutput::new(
@@ -348,6 +403,7 @@ impl TursoMcpServer {
 
     fn execute_query(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
         let query = validated_query(arguments, StmtClass::Select)?;
+        let max_rows = max_rows_arg(arguments)?;
 
         let conn = self.conn.lock().unwrap().clone();
         let Some(mut rows) = conn
@@ -356,7 +412,7 @@ impl TursoMcpServer {
         else {
             return Ok(ToolOutput::new(
                 "No results returned from the query",
-                json!({ "columns": [], "rows": [], "row_count": 0 }),
+                json!({ "columns": [], "rows": [], "row_count": 0, "truncated": false }),
             ));
         };
 
@@ -366,12 +422,18 @@ impl TursoMcpServer {
 
         let mut text_rows = Vec::new();
         let mut json_rows = Vec::new();
+        let mut truncated = false;
         rows.run_with_row_callback(|row| {
+            if json_rows.len() >= max_rows {
+                truncated = true;
+                return Ok(());
+            }
             let mut text_row = Vec::new();
             let mut json_row = Vec::new();
             for value in row.get_values() {
-                text_row.push(value.to_string());
-                json_row.push(json_value(value));
+                let (text_cell, json_cell) = display_cell(value);
+                text_row.push(text_cell);
+                json_row.push(json_cell);
             }
             text_rows.push(text_row);
             json_rows.push(json_row);
@@ -394,11 +456,21 @@ impl TursoMcpServer {
         if text.is_empty() {
             text = "No results returned from the query".to_string();
         }
+        if truncated {
+            text.push_str(&format!(
+                "Showing the first {max_rows} rows; more exist. Add LIMIT/OFFSET or an aggregate.\n"
+            ));
+        }
 
         let row_count = json_rows.len();
         Ok(ToolOutput::new(
             text,
-            json!({ "columns": headers, "rows": json_rows, "row_count": row_count }),
+            json!({
+                "columns": headers,
+                "rows": json_rows,
+                "row_count": row_count,
+                "truncated": truncated,
+            }),
         ))
     }
 
@@ -443,16 +515,26 @@ impl TursoMcpServer {
             }
         }
 
+        // A `:memory:` database starts empty every time it is opened, so it is
+        // always "created"; for a real file, check before opening since opening
+        // is what creates it.
+        let created = path == ":memory:" || !Path::new(&path).exists();
+
         let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
-            Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect))
+            Connection::from_uri(&path, self.db_opts, Arc::new(SqliteDialect))
                 .map_err(|e| format!("Failed to open database '{path}': {e}"))?
                 .1
         } else {
+            let flags = if self.readonly {
+                OpenFlags::default().union(OpenFlags::ReadOnly)
+            } else {
+                OpenFlags::default()
+            };
             let (_io, db) = Database::open_new(
                 &path,
                 None::<&str>,
-                OpenFlags::default(),
-                DatabaseOpts::new().with_autovacuum(false),
+                flags,
+                self.db_opts.turso_cli(),
                 None,
                 Arc::new(SqliteDialect),
             )
@@ -464,13 +546,19 @@ impl TursoMcpServer {
         *self.conn.lock().unwrap() = conn;
         *self.current_db_path.lock().unwrap() = Some(path.clone());
 
+        let message = if created {
+            format!("Created new empty database at {path}")
+        } else {
+            format!("Opened existing database {path}")
+        };
         Ok(ToolOutput::new(
-            format!("Successfully opened database: {path}"),
-            json!({ "path": path }),
+            message,
+            json!({ "path": path, "created": created }),
         ))
     }
 
     fn schema_change(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
+        self.require_writable()?;
         let query = validated_query(arguments, StmtClass::Schema)?;
 
         let conn = self.conn.lock().unwrap().clone();
@@ -489,6 +577,7 @@ impl TursoMcpServer {
         class: StmtClass,
         verb: &str,
     ) -> Result<ToolOutput, String> {
+        self.require_writable()?;
         let query = validated_query(arguments, class)?;
 
         let conn = self.conn.lock().unwrap().clone();
@@ -501,6 +590,20 @@ impl TursoMcpServer {
             format!("{verb} successful. {changes} {rows} changed."),
             json!({ "changes": changes }),
         ))
+    }
+
+    /// Write tools call this first: `--readonly` is a promise to the operator
+    /// that nothing on disk changes, so it must hold regardless of which
+    /// database `open_database` has switched the connection to.
+    fn require_writable(&self) -> Result<(), String> {
+        if self.readonly {
+            return Err(
+                "This server was started with --readonly, so writes are rejected. \
+Use execute_query to read data."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -529,13 +632,16 @@ fn require_single_stmt(sql: &str, class: StmtClass) -> Result<(), String> {
     };
     match parser.next_cmd() {
         Ok(None) => {}
-        Ok(Some(_)) => return Err(class.single_statement_error().to_string()),
+        Ok(Some(_)) => return Err(class.single_statement_error()),
         Err(e) => return Err(format!("Failed to parse SQL: {e}")),
     }
     match cmd {
         Cmd::Stmt(stmt) if StmtClass::of(&stmt) == Some(class) => Ok(()),
+        // EXPLAIN and EXPLAIN QUERY PLAN execute nothing; execute_query is the
+        // only tool that reads, so it is the only one that gets to see plans.
+        Cmd::Explain(_) | Cmd::ExplainQueryPlan { .. } if class == StmtClass::Select => Ok(()),
         Cmd::Stmt(_) | Cmd::Explain(_) | Cmd::ExplainQueryPlan { .. } => {
-            Err(class.wrong_class_error().to_string())
+            Err(class.wrong_class_error())
         }
     }
 }
@@ -548,6 +654,75 @@ fn json_value(value: &DbValue) -> Value {
         DbValue::Text(text) => json!(text.as_str()),
         DbValue::Blob(blob) => json!({ "blob": hex::encode(&blob[..]) }),
     }
+}
+
+/// Text and json representation of one query result cell, with long values
+/// cut down so one giant value can't blow out memory or context the way too
+/// many rows can (see `DEFAULT_MAX_ROWS`).
+fn display_cell(value: &DbValue) -> (String, Value) {
+    match value {
+        DbValue::Text(text) => {
+            let s = text.as_str();
+            if s.len() <= MAX_VALUE_BYTES {
+                (s.to_string(), json!(s))
+            } else {
+                let shown = format!(
+                    "{}... [truncated, {} bytes total]",
+                    truncate_str(s, MAX_VALUE_BYTES),
+                    s.len()
+                );
+                (shown.clone(), json!(shown))
+            }
+        }
+        DbValue::Blob(blob) => {
+            if blob.len() <= MAX_VALUE_BYTES {
+                let hex = hex::encode(&blob[..]);
+                (
+                    format!("<blob {} bytes: {hex}>", blob.len()),
+                    json!({ "blob": hex }),
+                )
+            } else {
+                let preview = hex::encode(&blob[..BLOB_PREVIEW_BYTES.min(blob.len())]);
+                let text = format!("<blob {} bytes: {preview}...>", blob.len());
+                let json = json!({ "blob": preview, "bytes": blob.len(), "truncated": true });
+                (text, json)
+            }
+        }
+        _ => (value.to_string(), json_value(value)),
+    }
+}
+
+/// Cuts `s` down to at most `max_bytes` bytes without splitting a UTF-8
+/// character in half.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn max_rows_arg(arguments: &Option<Value>) -> Result<usize, String> {
+    let Some(max_rows) = arguments.as_ref().and_then(|args| args.get("max_rows")) else {
+        return Ok(DEFAULT_MAX_ROWS);
+    };
+    match max_rows.as_u64() {
+        Some(n) if n >= 1 => Ok(n as usize),
+        _ => Err("max_rows must be a positive integer".to_string()),
+    }
+}
+
+/// Quotes a SQL identifier so names with spaces, quotes, or reserved words
+/// (e.g. `order`, `my table`) parse correctly when interpolated into SQL text.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn table_not_found(table_name: &str) -> String {
+    format!("Table '{table_name}' not found. Call list_tables to see what exists.")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -598,24 +773,47 @@ impl StmtClass {
         }
     }
 
-    fn single_statement_error(self) -> &'static str {
-        match self {
-            Self::Select => "Only a single SELECT query is allowed",
+    fn single_statement_error(self) -> String {
+        let base = match self {
+            Self::Select => {
+                "Only a single SELECT, EXPLAIN, or EXPLAIN QUERY PLAN statement is allowed"
+            }
             Self::Insert => "Only a single INSERT statement is allowed",
             Self::Update => "Only a single UPDATE statement is allowed",
             Self::Delete => "Only a single DELETE statement is allowed",
             Self::Schema => "Only a single schema modification statement is allowed",
-        }
+        };
+        format!("{base}. Nothing was executed; send one statement per call.")
     }
 
-    fn wrong_class_error(self) -> &'static str {
-        match self {
-            Self::Select => "Only SELECT queries are allowed",
-            Self::Insert => "Only INSERT statements are allowed",
-            Self::Update => "Only UPDATE statements are allowed",
-            Self::Delete => "Only DELETE statements are allowed",
-            Self::Schema => "Only CREATE, ALTER, and DROP statements are allowed",
-        }
+    /// Names the neighboring tool for what was actually sent, and the SQL
+    /// forms no tool accepts, so a model does not keep guessing at this tool.
+    fn wrong_class_error(self) -> String {
+        let what_this_tool_does = match self {
+            Self::Select => {
+                "execute_query runs a single SELECT, EXPLAIN, or EXPLAIN QUERY PLAN. \
+Use insert_data / update_data / delete_data for writes and schema_change for CREATE/ALTER/DROP."
+            }
+            Self::Insert => {
+                "insert_data runs a single INSERT. Use execute_query for SELECT, \
+update_data / delete_data for other writes, and schema_change for CREATE/ALTER/DROP."
+            }
+            Self::Update => {
+                "update_data runs a single UPDATE. Use execute_query for SELECT, \
+insert_data / delete_data for other writes, and schema_change for CREATE/ALTER/DROP."
+            }
+            Self::Delete => {
+                "delete_data runs a single DELETE. Use execute_query for SELECT, \
+insert_data / update_data for other writes, and schema_change for CREATE/ALTER/DROP."
+            }
+            Self::Schema => {
+                "schema_change runs a single CREATE, ALTER, or DROP statement. Use execute_query \
+for SELECT and insert_data / update_data / delete_data for writes."
+            }
+        };
+        format!(
+            "{what_this_tool_does} PRAGMA, BEGIN/COMMIT, ATTACH, and VACUUM are not available in this server."
+        )
     }
 }
 
@@ -668,7 +866,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            "Only a single UPDATE statement is allowed"
+            "Only a single UPDATE statement is allowed. Nothing was executed; send one statement per call."
         );
 
         let dump = orders_dump(&server);
@@ -713,7 +911,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            "Only a single INSERT statement is allowed"
+            "Only a single INSERT statement is allowed. Nothing was executed; send one statement per call."
         );
         assert!(!orders_dump(&server).contains("3 | NEW | 3"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
@@ -732,7 +930,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            "Only a single DELETE statement is allowed"
+            "Only a single DELETE statement is allowed. Nothing was executed; send one statement per call."
         );
         let dump = orders_dump(&server);
         assert!(dump.contains("1 | READY | 1"), "{dump}");
@@ -752,7 +950,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            "Only a single schema modification statement is allowed"
+            "Only a single schema modification statement is allowed. Nothing was executed; send one statement per call."
         );
         assert!(orders_dump(&server).contains("1 | READY | 1"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
@@ -769,7 +967,10 @@ mod tests {
             "SELECT order_id FROM bench_orders WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         );
 
-        assert_eq!(result.unwrap_err(), "Only a single SELECT query is allowed");
+        assert_eq!(
+            result.unwrap_err(),
+            "Only a single SELECT, EXPLAIN, or EXPLAIN QUERY PLAN statement is allowed. Nothing was executed; send one statement per call."
+        );
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
     }
 
@@ -815,6 +1016,7 @@ mod tests {
                 "columns": ["i", "r", "t", "b", "n"],
                 "rows": [[7, 1.5, "hi", { "blob": "00ff" }, null]],
                 "row_count": 1,
+                "truncated": false,
             })
         );
     }
@@ -849,6 +1051,240 @@ mod tests {
             .call_tool("describe_table", &Some(json!({ "table_name": "nope" })))
             .expect("the tool exists");
 
-        assert_eq!(result.unwrap_err(), "Table 'nope' not found");
+        assert_eq!(
+            result.unwrap_err(),
+            "Table 'nope' not found. Call list_tables to see what exists."
+        );
+    }
+
+    #[test]
+    fn describe_table_quotes_a_name_with_a_space() {
+        let server = memory_server();
+        call(
+            &server,
+            "schema_change",
+            "CREATE TABLE \"my table\" (id INTEGER PRIMARY KEY)",
+        )
+        .expect("create the table");
+
+        let result = server
+            .call_tool("describe_table", &Some(json!({ "table_name": "my table" })))
+            .expect("the tool exists")
+            .expect("the table exists, once its name is quoted");
+
+        assert_eq!(result.structured["columns"][0]["name"], "id");
+    }
+
+    #[test]
+    fn execute_query_caps_rows_by_default() {
+        let server = memory_server();
+        call(&server, "schema_change", "CREATE TABLE many (n INTEGER)").unwrap();
+        for n in 0..250 {
+            call(
+                &server,
+                "insert_data",
+                &format!("INSERT INTO many VALUES ({n})"),
+            )
+            .unwrap();
+        }
+
+        let result = call(&server, "execute_query", "SELECT n FROM many ORDER BY n")
+            .expect("the query is valid");
+
+        assert_eq!(result.structured["row_count"], 200);
+        assert_eq!(result.structured["truncated"], true);
+        assert_eq!(result.structured["rows"].as_array().unwrap().len(), 200);
+        assert!(
+            result.text.contains(
+                "Showing the first 200 rows; more exist. Add LIMIT/OFFSET or an aggregate."
+            ),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn execute_query_max_rows_overrides_the_default() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server
+            .call_tool(
+                "execute_query",
+                &Some(json!({
+                    "query": "SELECT order_id FROM bench_orders ORDER BY order_id",
+                    "max_rows": 1,
+                })),
+            )
+            .expect("the tool exists")
+            .expect("the query is valid");
+
+        assert_eq!(result.structured["row_count"], 1);
+        assert_eq!(result.structured["truncated"], true);
+    }
+
+    #[test]
+    fn execute_query_truncates_long_text_values() {
+        let server = memory_server();
+        call(&server, "schema_change", "CREATE TABLE big (t TEXT)").unwrap();
+        let long_value = "x".repeat(2000);
+        server
+            .call_tool(
+                "insert_data",
+                &Some(json!({ "query": "INSERT INTO big VALUES (?)".replace("?", &format!("'{long_value}'")) })),
+            )
+            .unwrap()
+            .unwrap();
+
+        let result = call(&server, "execute_query", "SELECT t FROM big").expect("valid query");
+
+        let text_value = result.structured["rows"][0][0].as_str().unwrap();
+        assert!(
+            text_value.len() < 2000,
+            "value was not truncated: {text_value}"
+        );
+        assert!(text_value.contains("truncated, 2000 bytes total"));
+    }
+
+    #[test]
+    fn execute_query_accepts_explain() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = call(
+            &server,
+            "execute_query",
+            "EXPLAIN QUERY PLAN SELECT * FROM bench_orders",
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn execute_query_still_rejects_pragma_by_name() {
+        let server = memory_server();
+
+        let result = call(&server, "execute_query", "PRAGMA table_info(bench_orders)");
+
+        let message = result.unwrap_err();
+        assert!(
+            message.contains("execute_query runs a single SELECT"),
+            "{message}"
+        );
+        assert!(message.contains("PRAGMA"), "{message}");
+    }
+
+    #[test]
+    fn open_database_reports_created_for_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        let server = memory_server();
+
+        let result = server
+            .call_tool(
+                "open_database",
+                &Some(json!({ "path": path.to_string_lossy() })),
+            )
+            .expect("the tool exists")
+            .expect("opening a new path succeeds");
+
+        assert_eq!(result.structured["created"], true);
+        assert!(
+            result.text.starts_with("Created new empty database"),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn open_database_reports_not_created_for_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.db");
+        let server = memory_server();
+        server
+            .call_tool(
+                "open_database",
+                &Some(json!({ "path": path.to_string_lossy() })),
+            )
+            .unwrap()
+            .unwrap();
+
+        let result = server
+            .call_tool(
+                "open_database",
+                &Some(json!({ "path": path.to_string_lossy() })),
+            )
+            .expect("the tool exists")
+            .expect("re-opening the same path succeeds");
+
+        assert_eq!(result.structured["created"], false);
+        assert!(
+            result.text.starts_with("Opened existing database"),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn readonly_server_rejects_every_write_tool() {
+        use super::super::readonly_memory_server;
+        let server = readonly_memory_server();
+
+        for (tool, sql) in [
+            ("insert_data", "INSERT INTO t VALUES (1)"),
+            ("update_data", "UPDATE t SET x=1"),
+            ("delete_data", "DELETE FROM t"),
+            ("schema_change", "CREATE TABLE t (x INTEGER)"),
+        ] {
+            let result = call(&server, tool, sql);
+            let message = result.unwrap_err();
+            assert!(
+                message.contains("--readonly"),
+                "{tool} did not mention --readonly: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_server_still_allows_reads_and_open_database() {
+        use super::super::readonly_memory_server;
+        let server = readonly_memory_server();
+
+        let list = server
+            .call_tool("list_tables", &Some(json!({})))
+            .expect("the tool exists");
+        assert!(list.is_ok(), "{list:?}");
+    }
+
+    #[test]
+    fn insert_data_is_marked_destructive() {
+        let catalog = catalog(false);
+        let insert = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "insert_data")
+            .unwrap();
+
+        assert_eq!(insert["annotations"]["destructiveHint"], true);
+    }
+
+    #[test]
+    fn readonly_catalog_marks_write_tools_unavailable() {
+        let catalog = catalog(true);
+        let insert = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "insert_data")
+            .unwrap();
+
+        assert!(
+            insert["description"]
+                .as_str()
+                .unwrap()
+                .contains("--readonly"),
+            "{insert}"
+        );
     }
 }
