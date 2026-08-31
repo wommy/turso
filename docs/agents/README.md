@@ -72,5 +72,7 @@ what it does (a correctness pass, or `--fix`/`--comment`) and it is still there.
 
 - **`.scratch/`** is the draft layer and is gitignored, so it appears in no
   branch. Anything another person must act on gets promoted to a GitHub issue.
-- **The triage labels do not exist on the fork yet** — see `triage-labels.md`
-  for the one command that creates them. `/triage` will fail until they do.
+- **Four of the five triage labels do not exist on the fork yet.** `wontfix`
+  is already there, inherited from upstream; the other four need creating from a
+  machine with `gh`, and `/triage` fails until they are. The commands are in
+  `triage-labels.md`.

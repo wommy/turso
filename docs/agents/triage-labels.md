@@ -16,20 +16,24 @@ vocabulary is aimed at a public OSS triage queue; these five are aimed at one
 question an agent has to answer — is this ticket ready to be worked unattended —
 and nothing upstream uses says that.
 
-## These labels do not exist yet
+## Four of these five do not exist yet
 
-**`/triage` will fail on first use until they are created.** They were not
-created here because the GitHub MCP server has no label-creation tool and the
-remote container has no `gh`. Create them from a machine that does:
+`wontfix` already exists on the fork, inherited from upstream Turso (white,
+"This will not be worked on"), and its meaning already matches — leave it alone.
+The other four need creating, and **`/triage` fails until they are**.
+
+They were not created here because the GitHub MCP server has no label-creation
+tool and the remote container has no `gh`. Run this from a machine that does:
 
 ```bash
-for l in needs-triage needs-info ready-for-agent ready-for-human wontfix; do
-  gh label create "$l" --repo wommy/turso
-done
+gh label create needs-triage    --repo wommy/turso --color fbca04 --description "Maintainer needs to evaluate this issue"
+gh label create needs-info      --repo wommy/turso --color d876e3 --description "Waiting on reporter for more information"
+gh label create ready-for-agent --repo wommy/turso --color 0e8a16 --description "Fully specified, ready for an AFK agent"
+gh label create ready-for-human --repo wommy/turso --color 1d76db --description "Requires human implementation"
 ```
 
-`gh label create` fails on a label that already exists, which is harmless — add
-`|| true` if re-running.
+`gh label create` errors on a label that already exists; pass `--force` to
+overwrite instead. Do not create `wontfix` — it will fail as a duplicate.
 
-Edit the middle column if the vocabulary ever changes; the skills read the
+Edit the middle column above if the vocabulary ever changes; the skills read the
 label string from there, not from the role name.
