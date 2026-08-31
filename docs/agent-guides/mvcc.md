@@ -71,15 +71,41 @@ PRAGMA mvcc_checkpoint_threshold = <pages>;
 
 Process: acquire lock → begin pager txn → write rows → commit → truncate log → fsync → release.
 
-## Current Limitations
+## Current State and Limitations
 
-**Not implemented:**
-- Garbage collection (old versions accumulate)
-- Recovery from logical log on restart
+**Implemented, worth knowing the shape of:**
+- Garbage collection. Runs inline on the commit path (`MvStore::should_gc` /
+  `gc_incremental`, `core/mvcc/database/mod.rs:7277` and `:7317`) once live
+  versions have grown past `mvcc_gc_threshold` (default 16K, pragma at
+  `core/pragma.rs:185`) since the last pass. Each pass is capped and resumable
+  (`MAX_CHAINS_PER_GC` chains, `core/mvcc/database/mod.rs:7186`), so it never
+  stalls the committing connection. It reclaims: aborted versions (Rule 1),
+  superseded versions once no active reader can see them and the delete is
+  checkpointed (Rule 2), and — only once the B-tree already has the row — the
+  last remaining current version (Rule 3, see `gc_version_chain`,
+  `core/mvcc/database/mod.rs:7736`). It does not reclaim versions still needed
+  by an open transaction, and it does not shrink memory for rows that are
+  still live.
+- Recovery from the logical log on restart. `maybe_recover_logical_log`
+  (`core/mvcc/database/mod.rs:8718`) is a real step in the MVCC bootstrap
+  state machine (`BootstrapState::Recover`, `core/mvcc/database/mod.rs:4841`),
+  not just a function that exists — every MVCC database open replays
+  operations committed after the last checkpoint before serving queries.
 
 **Known issues:**
-- Checkpoint blocks other transactions, even reads!
-- No spilling to disk; memory use concerns
+- Checkpoint blocks other transactions, even reads, by default. MVCC only
+  supports Passive and Truncate checkpoint modes (Full/Restart map to
+  Truncate); Truncate takes a blocking lock for the whole checkpoint
+  (`core/mvcc/database/checkpoint_state_machine.rs:743`). Passive avoids the
+  block but only runs behind the experimental
+  `--experimental-mvcc-passive-checkpoint` CLI flag (`cli/app.rs:117`), which
+  is off by default.
+- No spilling to disk. The version store (`rows` / `index_rows`) is plain
+  in-memory `SkipMap`s with no disk-backed eviction path — nothing in
+  `core/mvcc/` writes a version out to reclaim RAM. GC (above) keeps *old*
+  versions from accumulating forever, but it cannot shrink memory used by
+  rows that are still live or still pinned by an open transaction, so memory
+  use still scales with live working-set size, not just history.
 
 ## Testing
 
