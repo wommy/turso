@@ -5,6 +5,20 @@ A single `target/` reaches 9 GB. Three worktrees exhausted the container's disk
 entirely. These are the measures that actually moved the number, with the ones
 that did not, so they are not tried again.
 
+## Two flags that are not guessable
+
+    cargo build -p turso_cli        # then run target/debug/tursodb directly
+    cargo clippy ... --allow unfulfilled-lint-expectations
+
+**Never `cargo run`.** It rebuilds the whole workspace at default features and
+has exhausted this container's disk twice. Build with `-p turso_cli` and run the
+artifact.
+
+**`--allow unfulfilled-lint-expectations`** covers a pre-existing failure in
+`core/json/cache.rs:107` — an `#[expect(clippy::new_without_default)]` this
+toolchain does not fire. No branch here touches `core/`, so it is never ours.
+CI runs a different toolchain and does not hit it, so this is a local flag only.
+
 ## Run the CLI tests serially
 
     cargo test -p turso_cli -- --test-threads=1

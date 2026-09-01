@@ -105,12 +105,10 @@ make one up, which is how SQLite 3.45.1 ended up standing in for a pinned 3.50.4
 
 | Situation | What to do |
 |---|---|
-| Need to run the binary | `cargo build -p turso_cli`, then run `target/debug/tursodb` directly. `cargo run` rebuilds the workspace at default features and has exhausted this container's disk twice. |
-| Cargo appears to hang | Another agent holds the lock on the shared target dir. Wait. Keep `CARGO_TARGET_DIR=/home/user/turso/target` and use the one that exists. |
-| Need pre-fix behaviour | A throwaway worktree at the parent commit, per [ADR 0005](../adr/0005-both-directions-of-a-guard-need-a-test.md). Keep the same target dir there too — a second one cost an agent time today. Leave the working tree as you found it; `AGENTS.md` bans stashing. |
-| Clippy wants more scope | Keep it to `-p turso_cli`. `--workspace` pulls in nine excluded crates and 2.2 GB of artifacts. `--allow unfulfilled-lint-expectations` covers a pre-existing mismatch in `core/json/cache.rs:107` that no branch here touches. |
-| Tests fail intermittently | Run with `-- --test-threads=1`. `cli/tests/mcp_http_transport.rs` binds real ports and races; that is [#41](https://github.com/wommy/turso/issues/41), not yours. |
+| Anything about building, linting or running tests | [`build-workflow.md`](./build-workflow.md) owns all of it — which cargo flags, which to avoid, the shared target dir, the serial-test flag. Point the brief there; do not copy the flags into it. |
+| Need pre-fix behaviour | A throwaway worktree at the parent commit, per [ADR 0005](../adr/0005-both-directions-of-a-guard-need-a-test.md). Leave the working tree as you found it; `AGENTS.md` bans stashing. |
 | An ADR or config file needs changing | Report that it does and stop. `.agents-ref` is a symlink into another repository — read through it, never write through it. |
+| The change wants a file the brief did not name | Report that, rather than widening. Two commits beat one that does two things. |
 | Anything else | Report `job: could_not` with the evidence. A good outcome, and the only sanctioned exit. |
 
 ## Structured in, structured out

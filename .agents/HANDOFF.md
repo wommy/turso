@@ -37,10 +37,10 @@ decision.
 - **A full upstream clone is at `/home/user/tursodatabase/turso`** — 19,656
   commits. Every fork checkout is shallow to 2026-05-07 and cannot date anything.
   Two findings were only datable because of this clone.
-- **`cargo clippy` fails on `core/json/cache.rs:107`**, a toolchain mismatch in a
-  crate no branch here touches. Add `--allow unfulfilled-lint-expectations`.
-- **Never `cargo run`** — it rebuilds the workspace at default features and has
-  exhausted this container's disk twice.
+- **Build and test rules live in
+  [`.agents/config/build-workflow.md`](config/build-workflow.md)**, not here.
+  There are several and they are not guessable; read it before the first cargo
+  command rather than after the first wasted hour.
 - **A real MCP client is installable here.** `pip install mcp` (2.1.1) and
   `npm view @modelcontextprotocol/sdk` (1.30.0) both reach their registries
   through the proxy. Driving the server with one found two bugs in twenty

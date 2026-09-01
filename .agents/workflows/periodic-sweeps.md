@@ -46,6 +46,7 @@ Run as parallel read-only agents. They do not conflict — none of them writes.
 | **What did we lose** | Diff the branch against whatever it replaced. Anything the old version did that no spec clause demands is what a spec-driven rewrite drops. |
 | **What already exists here** | Did we hand-roll something the workspace already has? The method is [`prior-capability-check`](prior-capability-check.md), which this loop exists to arm — do not restate it in the brief, point the agent at it. |
 | **Where does upstream repeat itself** | Their duplication, not ours. Findable with the fix history as an index, and the strongest shape is one copy getting a bug fix the other did not. |
+| **Has this directory rotted** | `.agents/` itself. It grows the way everything else here does, and nobody is auditing the auditor. See below — this is the one sweep with a deletion bias. |
 
 The first two are about this branch. The last two are about the codebase and
 pay off across branches, so they can run less often.
@@ -61,6 +62,38 @@ pay off across branches, so they can run less often.
    go where the wrong claim lived.
 5. Record what came back **clean**. It bounds the claim and stops the next
    sweep redoing the same ground.
+
+## The config sweep, because nobody audits the auditor
+
+`.agents/` was 1,295 lines one morning, 1,209 after a consolidation pass that
+removed 86, and 1,621 by that evening. Every one of those 412 added lines was
+written by someone who had just finished arguing that documents rot when they
+grow. Consolidating once does not hold.
+
+Four checks, all cheap:
+
+```
+wc -l $(find .agents -name '*.md')          # the trend, against the last sweep's commit
+```
+
+- **A rule with two homes.** The sanctioned-paths block lived in eight agent
+  briefs and in none of these files. Grep a distinctive phrase from any rule
+  you have written recently; more than one hit is the finding.
+- **A snapshot with no date.** Anything asserting what the code currently does
+  needs to say which commit it was true of, or it will be read as current long
+  after it is not.
+- **A document no pointer reaches.** Every file earns a row in
+  [`../README.md`](../README.md) or it is riding on somebody's memory.
+
+**End with a deletion, or say why there is none.** That clause is the whole
+point of this sweep. The failure mode is sediment — stale layers settling
+because adding feels safe and removing feels risky — and a sweep that only ever
+adds is what produces it. "Nothing should go" is a legitimate answer exactly
+once; twice in a row means the bar has quietly moved.
+
+Record the outcome in the commit message rather than in a file. Git already
+keeps that as a series, and a tracking document here would be one more thing
+for the next sweep to find.
 
 ## Checkpoint
 
