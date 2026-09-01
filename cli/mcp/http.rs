@@ -538,6 +538,57 @@ mod tests {
         assert!(!tools.is_empty(), "tools array must not be empty");
     }
 
+    /// The `2026-07-28` changelog (Major changes, item 1) and
+    /// `streamable-http.mdx`'s "Earlier Streamable HTTP Revisions" section
+    /// retire protocol-level sessions: "An `Mcp-Session-Id` header on a
+    /// request: ignore it, and do not mint or echo session IDs." Nothing in
+    /// this transport reads or sets that header today, so this pins the
+    /// no-op: a request carrying it is answered exactly as the same request
+    /// without it, and the header never appears on the way back. Without
+    /// this test, a later slice could start routing on the header - or
+    /// echoing it back - with nothing here going red.
+    ///
+    /// The header-free case is exercised by every other test in this file,
+    /// so only the with-header case earns a test of its own here (ADR 0005's
+    /// "good direction already covered incidentally" exception).
+    #[test]
+    fn a_request_carrying_mcp_session_id_is_answered_exactly_as_without_it() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        .to_string();
+
+        let without_session = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "tools/list".to_string())],
+            body: request_body.clone().into_bytes(),
+        };
+        let with_session = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+                ("Mcp-Session-Id".to_string(), "deadbeef-session".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let baseline = http_response_for(&server, &without_session);
+        let with_header = http_response_for(&server, &with_session);
+
+        assert_eq!(with_header.status, baseline.status);
+        assert_eq!(with_header.content_type, baseline.content_type);
+        assert_eq!(with_header.body, baseline.body);
+
+        let formatted = format_http_response(&with_header);
+        let formatted_text = String::from_utf8_lossy(&formatted).to_ascii_lowercase();
+        assert!(
+            !formatted_text.contains("mcp-session-id"),
+            "response must not mint or echo a session header: {formatted_text}"
+        );
+    }
+
     /// The spec's MUST at L271-273: a method the server does not implement
     /// is a 404, not the 200-with-embedded-error every other JSON-RPC
     /// failure gets. `nonexistent/thing` reaches `handle_message` past every
