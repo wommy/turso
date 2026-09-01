@@ -26,6 +26,19 @@ Checking this branch out replaces the working tree, so use a worktree
 (`git worktree add ../turso-agent-config claude/agent-config`) rather than
 switching branches in place while feature work is in flight.
 
+A worktree only contains its own branch, so nothing here is readable from the
+worktrees where the code actually gets written. An agent sent into a feature
+worktree cannot see these ADRs or the glossary, and will happily re-open a
+decision recorded three directories away — which has already happened, with an
+architecture review reasoning about HTTP libraries that ADR 0002 rules out. The
+fix is to link `CONTEXT.md` and `docs/adr/` into each worktree and list them in
+`.git/info/exclude`, which is shared across all worktrees and keeps them out of
+`git status`.
+
+Untracked copies from the rejected option above must not be left behind. A
+stray `CONTEXT.md` in another worktree competes with this one, and the reader
+has no way to tell which is current.
+
 `AGENTS.md` is edited here, and upstream owns that file, so this branch will
 conflict on an upstream sync. The block is kept short and appended at the end to
 make that conflict trivial to resolve.
