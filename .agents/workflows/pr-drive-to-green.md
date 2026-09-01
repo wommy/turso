@@ -168,6 +168,15 @@ It has three answers, not two.
   test turned out to be alive under a different commit. Had they not been, the
   event would have been the only warning that a fix had been lost.
 
+  One rebase produces a whole segment of unreachable commits, and the events
+  arrive for all of them - two came three minutes apart. Answer it once at the
+  segment level: diff the pre-rebase tip against the branch and read the
+  **deletions**, which is where lost work shows. Insertions are just the later
+  commits the rewrite folded in. In the case above the deletions were the
+  truncation fix replacing its own buggy line, plus a one-tool readonly
+  assertion that had been widened into a loop over all four write tools - so
+  the rewrite had strengthened the coverage, not dropped it.
+
 ## Definition of done
 
 Every watched PR is merged or closed. Until then the loop re-arms, including
