@@ -77,11 +77,17 @@ which is a real gap but a different one than this ADR was written to catch.
 
 A PR that adds or changes a guard is expected to show both directions in its
 diff, unless one of the two exceptions above applies and the PR says which.
-A PR fixing a guard bug is expected to show the new test failing against
-`git stash` or the pre-fix commit before showing it passing — asserting this
-in prose is not the same as showing it, and it hasn't been trustworthy on
-this project when a test was written by a model that also wrote the fix it's
-supposed to catch.
+A PR fixing a guard bug is expected to show the new test failing against the
+pre-fix commit before showing it passing. Asserting this in prose is not the
+same as showing it, and it has not been trustworthy here when a test was
+written by the same model that wrote the fix it is supposed to catch.
+
+Get the failure by checking the parent commit out into a worktree of its own
+and copying the test across, or by isolating the test where its neighbours
+will not compile. Not by stashing: `AGENTS.md` bans that outright, and it is
+also the method that produced the wrong answer last time — five tests all
+reported `did_not_compile` because one neighbour broke the build, and one of
+the five turned out to pass without the fix.
 
 This doesn't retroactively fail the existing suite. The gaps above are
 recorded in the audit table as findings, not filed as bugs against whoever

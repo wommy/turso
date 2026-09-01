@@ -45,15 +45,26 @@ caught a false claim in a brief twice.
 - **Name the failure modes that count as findings.** "A suite that silently
   skipped is a finding, not a pass." Otherwise an agent optimising for a green
   result will find one.
-- **Forbid the workarounds you can foresee**, by name: no `--release`, no
-  `git stash`, no substituting a different version of a pinned dependency.
+- **Name the sanctioned path through each blocker you can foresee.** A bare
+  ban makes the banned move the most available idea in the brief; say what to
+  do instead and the workaround never gets named at all. "Use the pinned
+  SQLite 3.50.4; if it will not download, report `could_not` with the error"
+  leaves nothing for a substitution to fill. Where a guardrail genuinely has
+  no positive form, keep the ban and put the target beside it.
 - **Make waiting explicit.** An agent told to run something long will otherwise
   end its turn expecting to be woken, and nothing wakes it. Tell it to poll in a
   bounded loop inside one long-timeout call and not to stop until the work is
   finished or genuinely blocked.
-- **Pre-load, do not describe.** Two implementation agents burned 68 tool calls
-  apiece, most of it rediscovering code the brief could have pasted. Paste the
-  function under change into the brief.
+- **Sharpen the pointer before you paste the code.** Two implementation agents
+  burned 68 tool calls apiece rediscovering code, and the obvious fix was to
+  paste the function into the brief. That is the wrong first move: pasted code
+  is a snapshot, and a brief carrying one has already gone stale here, on a
+  constant that did not exist by the time the agent looked. Name the symbol
+  and the line instead — `is_method_not_found` at `cli/mcp/http.rs:167`, and
+  its one call site at 146 — and the agent reads the code that is there
+  rather than the code that was. Paste only when there is no name to point
+  at: a shape you want that does not exist yet, or the exact words of a spec
+  clause.
 - **One agent per worktree.** Not per file, and not per behaviour: two agents in
   one checkout collide on the index. One of them stashed two others' work when I
   wrongly read its commits as finished. Give each its own worktree and name the

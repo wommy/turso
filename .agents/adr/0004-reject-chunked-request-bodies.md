@@ -1,7 +1,16 @@
 # Reject chunked request bodies with 411 rather than de-chunking them
 
-The MCP HTTP transport refuses a request carrying `Transfer-Encoding: chunked`
-with `411 Length Required`. It understands `Content-Length` and nothing else.
+The MCP HTTP transport will refuse a request carrying `Transfer-Encoding:
+chunked` with `411 Length Required`, and understand `Content-Length` and
+nothing else.
+
+**Decided, not yet built.** No `Transfer-Encoding`, `chunked` or `411` appears
+anywhere in `cli/` today; this is slice 9 of
+[#24](https://github.com/wommy/turso/issues/24). An earlier version of this
+file described the refusal in the present tense, which a guard audit read as a
+claim about the code and correctly reported as false. An ADR that records a
+decision ahead of the work has to say so, or it becomes a document asserting
+behaviour nobody can find.
 
 ## Why this needs recording
 
