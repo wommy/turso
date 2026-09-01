@@ -138,8 +138,10 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
             return forbidden_origin(origin);
         }
     }
-    if let Err(response) = validate_headers(req) {
-        return response;
+    if !is_notification(&req.body) {
+        if let Err(response) = validate_headers(req) {
+            return response;
+        }
     }
     let body = server
         .handle_message(&String::from_utf8_lossy(&req.body))
@@ -175,12 +177,17 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
 /// module is layer C, open as PR #18 - a wider blast radius than this status-
 /// code slice should carry.
 ///
-/// A notification has no response at all: `handle_message` gives back `None`,
-/// which `http_response_for` turns into an empty string before this function
-/// ever sees it. An empty string does not parse as JSON, so it falls through
-/// to the same `200` as any other unparseable or error-free body - unchanged
-/// from what a notification got before this function existed.
+/// A notification has no response at all: `handle_message` gives back
+/// `None`, which `http_response_for` turns into an empty string before this
+/// function ever sees it - and, per `is_notification`, never reaches
+/// `validate_headers` either. An empty body only ever means a notification
+/// was accepted, so it gets the `202 Accepted` the spec requires for that
+/// case (MUST, `streamable-http.mdx` L86-88), not the `200` an ordinary
+/// JSON-RPC response gets.
 fn http_status_for(body: &str) -> u16 {
+    if body.is_empty() {
+        return 202;
+    }
     let Ok(response) = serde_json::from_str::<Value>(body) else {
         return 200;
     };
@@ -255,6 +262,27 @@ fn forbidden_origin(origin: &str) -> HttpResponse {
         body: serde_json::to_vec(&response).unwrap_or_default(),
         extra_headers: Vec::new(),
     }
+}
+
+/// A JSON-RPC message with no `id` field is a notification - the same test
+/// `handle_message` (`cli/mcp/mod.rs`) makes on `raw.get("id")` to decide
+/// whether to answer at all. `http_response_for` uses it to decide whether
+/// `validate_headers` runs: the spec defines no header requirements for a
+/// notification POST (`streamable-http.mdx` L101-103, this revision), so
+/// enforcing the request-metadata headers on one would reject a conforming
+/// client. `Origin` is unaffected - it is checked in `http_response_for`
+/// before this, not inside `validate_headers`, because it is the
+/// DNS-rebinding defense (MUST, L57-63) rather than a request-metadata
+/// header, and applies to every request regardless of `id`.
+///
+/// A body that fails to parse as JSON is not a notification: `handle_message`
+/// itself answers that case with a `PARSE_ERROR` response rather than
+/// silence, so its headers are still validated, unchanged from before this
+/// function existed.
+fn is_notification(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| value.get("id").is_none())
 }
 
 /// The spec's request-metadata headers, checked against the JSON-RPC body
@@ -1076,6 +1104,89 @@ mod tests {
         let req = HttpRequest {
             headers: vec![("Origin".to_string(), "http://evil.example.com".to_string())],
             body: b"not even json".to_vec(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32600);
+    }
+
+    /// The spec's MUST at `streamable-http.mdx` L86-88: a notification the
+    /// server accepts gets `202 Accepted` with no body at all - not the
+    /// `200` an ordinary JSON-RPC response gets. Headers agree with the
+    /// body here so header validation, unaffected by this fix, cannot be
+    /// what produces the status seen - see the next test for that.
+    #[test]
+    fn a_notification_returns_202_with_an_empty_body() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![(
+                "Mcp-Method".to_string(),
+                "notifications/initialized".to_string(),
+            )],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 202);
+        assert!(response.body.is_empty());
+    }
+
+    /// The spec's note at L101-103: header requirements for notification
+    /// POSTs are not defined by this revision, so a disagreeing `Mcp-Method`
+    /// must not stop a notification from being accepted. Against unchanged
+    /// code this same disagreement produces the 400/`HEADER_MISMATCH` that
+    /// `an_mcp_method_header_that_disagrees_with_the_body_method_is_rejected`
+    /// asserts for a request that carries an `id`.
+    #[test]
+    fn a_notification_with_a_disagreeing_mcp_method_header_is_still_accepted() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "tools/list".to_string())],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 202);
+        assert!(response.body.is_empty());
+    }
+
+    /// The direction that stops the previous test's fix going too far: the
+    /// `Origin` check is the DNS-rebinding defense (MUST, L57-63), not a
+    /// request-metadata header, and it has nothing to do with whether the
+    /// body carries an `id`. A notification must not get a pass on it just
+    /// because its headers are otherwise unvalidated.
+    #[test]
+    fn a_notification_with_a_forbidden_origin_is_still_rejected() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Origin".to_string(), "http://evil.example.com".to_string())],
+            body: request_body.into_bytes(),
         };
 
         let response = http_response_for(&server, &req);
