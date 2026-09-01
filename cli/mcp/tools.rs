@@ -1063,6 +1063,55 @@ mod tests {
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
     }
 
+    /// The other direction of the class check above: every write tool must
+    /// refuse a well-formed, single statement of the wrong class, not just
+    /// a trailing extra one. Without this, `insert_data` given a bare DELETE
+    /// would run it - the class check would have quietly stopped working and
+    /// nothing here would notice.
+    #[test]
+    fn each_write_tool_refuses_a_statement_of_the_wrong_class() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        for (tool, result, expected) in [
+            (
+                "insert_data",
+                server.insert_data(&query_arg("DELETE FROM bench_orders WHERE order_id=1")),
+                "Only INSERT statements are allowed",
+            ),
+            (
+                "update_data",
+                server.update_data(&query_arg("INSERT INTO bench_orders VALUES (3, 'NEW', 3)")),
+                "Only UPDATE statements are allowed",
+            ),
+            (
+                "delete_data",
+                server.delete_data(&query_arg(
+                    "UPDATE bench_orders SET status='X' WHERE order_id=1",
+                )),
+                "Only DELETE statements are allowed",
+            ),
+            (
+                "schema_change",
+                server.schema_change(&query_arg("DELETE FROM bench_orders WHERE order_id=1")),
+                "Only CREATE, ALTER, and DROP statements are allowed",
+            ),
+        ] {
+            let error = result.expect_err(&format!("{tool} must refuse a mismatched statement"));
+            assert!(error.contains(expected), "{tool}: {error}");
+        }
+
+        let dump = orders_dump(&server);
+        assert!(
+            dump.contains("1 | READY | 1"),
+            "nothing should have run: {dump}"
+        );
+        assert!(
+            dump.contains("2 | HOLD | 2"),
+            "nothing should have run: {dump}"
+        );
+    }
+
     /// `changes()` is one counter on the shared connection, overwritten by
     /// whichever statement last ran. Two threads sharing a server must each
     /// see their own write's count, never a count left behind by the other
@@ -1176,6 +1225,52 @@ mod tests {
         assert!(
             result["content"][0]["text"].as_str().unwrap().contains('|'),
             "the human-readable table is still there for a person"
+        );
+    }
+
+    /// `describe_table` had no test in either direction: a guard that refused
+    /// every call would have passed the suite just as well as this one. This
+    /// covers both refusals, and `describe_table_accepts_a_table_that_exists`
+    /// below covers the accepting side that would otherwise be missing.
+    #[test]
+    fn describe_table_rejects_a_missing_table_name() {
+        let server = memory_server();
+
+        let error = server
+            .describe_table(&None)
+            .expect_err("a call with no table_name must be refused");
+        assert!(
+            error.contains("Missing or invalid table_name parameter"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn describe_table_rejects_a_table_that_does_not_exist() {
+        let server = memory_server();
+
+        let error = server
+            .describe_table(&Some(json!({ "table_name": "ghost" })))
+            .expect_err("an unknown table must be refused");
+        assert!(error.contains("Table 'ghost' not found"), "got: {error}");
+    }
+
+    #[test]
+    fn describe_table_accepts_a_table_that_exists() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server
+            .describe_table(&Some(json!({ "table_name": "bench_orders" })))
+            .expect("an existing table must be described");
+        assert!(result.text.contains("order_id"), "{}", result.text);
+        assert_eq!(result.structured["table"], "bench_orders");
+        let columns = result.structured["columns"].as_array().unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|c| c["name"] == "order_id" && c["primary_key"] == true),
+            "{columns:?}"
         );
     }
 
