@@ -143,6 +143,14 @@ cancelled suites from what it covers. Two such events arrived on PR #1 whose
 blacksmith jobs were, without exception, cancelled. Read the runs, never the
 envelope.
 
+These also **replay on historical commits**. Four arrived in one evening
+carrying `head_sha` values that were ancestors of the branch head, not the
+head itself - one of them a commit from the previous day. So the first check
+is the cheapest one: if `git merge-base --is-ancestor <event sha> <branch
+head>` succeeds and the head is one you have already looked at, the event is
+about a commit that has been superseded and there is nothing behind it. Only
+an event whose SHA *is* the current head is worth pulling the runs for.
+
 ## Definition of done
 
 Every watched PR is merged or closed. Until then the loop re-arms, including
