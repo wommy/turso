@@ -4,7 +4,10 @@ use super::protocol::{
     UNSUPPORTED_PROTOCOL_VERSION,
 };
 use super::TursoMcpServer;
-use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
+use crate::http::{
+    format_http_response, parse_http_request, read_http_request, write_response_bounded,
+    HttpResponse,
+};
 use anyhow::Result;
 use base64::Engine;
 use serde_json::Value;
@@ -15,6 +18,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// How long a response has to leave the socket before the connection is
+/// given up on. A client that stops reading would otherwise hold open both
+/// its thread and one of the `MAX_CONNECTIONS` slots, forever. Shorter than
+/// the sync server's 120s, because MCP responses are small JSON rather than
+/// a database's worth of pages.
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Caps the threads `run_http` can have in flight at once, so a connection
 /// flood cannot spawn one thread per attacker socket. No derivation for this
@@ -112,7 +122,6 @@ impl TursoMcpServer {
 
     fn handle_http_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
         let request_data = read_http_request(&mut stream)?;
         let (method, path, headers, body) = parse_http_request(&request_data)?;
@@ -128,8 +137,12 @@ impl TursoMcpServer {
             }
         };
 
-        stream.write_all(&format_http_response(&response))?;
-        stream.flush()?;
+        write_response_bounded(
+            &mut stream,
+            &format_http_response(&response),
+            WRITE_DEADLINE,
+            &self.interrupt_count,
+        )?;
         Ok(())
     }
 }
