@@ -9,12 +9,24 @@ use anyhow::Result;
 use base64::Engine;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// Caps the threads `run_http` can have in flight at once, so a connection
+/// flood cannot spawn one thread per attacker socket. No derivation for this
+/// figure was found on any branch that has used it; kept as the only number
+/// anyone wrote down.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long `reject_over_capacity` gives a socket it is about to refuse.
+/// The caller is already shedding load, so this is a short, best-effort
+/// budget rather than the request-handling deadline `handle_http_connection`
+/// uses.
+const REJECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The MCP spec's single Streamable HTTP endpoint. Any other path answers
 /// 404 regardless of method; GET and DELETE to this one answer 405 instead,
@@ -56,16 +68,28 @@ impl TursoMcpServer {
             thread::sleep(Duration::from_millis(100));
         });
 
-        loop {
+        let active_connections = AtomicUsize::new(0);
+
+        // One thread per connection, so a client that stalls mid-request
+        // cannot hold up every request behind it on the accept loop.
+        thread::scope(|scope| loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
             }
 
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    if let Err(e) = self.handle_http_connection(stream) {
-                        eprintln!("MCP HTTP: error handling connection: {e}");
+                    if !try_reserve_connection(&active_connections) {
+                        reject_over_capacity(stream);
+                        continue;
                     }
+                    let active_connections = &active_connections;
+                    scope.spawn(move || {
+                        if let Err(e) = self.handle_http_connection(stream) {
+                            eprintln!("MCP HTTP: error handling connection: {e}");
+                        }
+                        active_connections.fetch_sub(1, Ordering::SeqCst);
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -75,7 +99,7 @@ impl TursoMcpServer {
                     eprintln!("MCP HTTP: error accepting connection: {e}");
                 }
             }
-        }
+        });
 
         let _ = monitor_handle.join();
         Ok(())
@@ -103,6 +127,43 @@ impl TursoMcpServer {
         stream.flush()?;
         Ok(())
     }
+}
+
+/// Reserves one of `MAX_CONNECTIONS` slots for the thread `run_http` is
+/// about to spawn, returning whether the reservation succeeded. A failed
+/// reservation puts the counter back where it found it, so a refused
+/// connection never leaves `active_connections` overcounted. Kept as its own
+/// function, apart from the socket work around it, so the accept-time cap
+/// can be asserted directly against the counter instead of through a live
+/// listener - see the tests below.
+fn try_reserve_connection(active_connections: &AtomicUsize) -> bool {
+    if active_connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        active_connections.fetch_sub(1, Ordering::SeqCst);
+        false
+    } else {
+        true
+    }
+}
+
+/// A best-effort reply: the caller is already shedding load, so a socket
+/// over `MAX_CONNECTIONS` is answered on a short timeout rather than given a
+/// thread of its own.
+fn reject_over_capacity(mut stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(REJECT_TIMEOUT));
+    // Closing a socket that still has unread bytes sitting in it makes the
+    // OS send a connection reset instead of a clean close, which looks like
+    // a broken connection rather than "503, please retry" - so drain
+    // whatever the client already sent first, within the same short budget.
+    let mut discard = [0u8; 8192];
+    while let Ok(n) = stream.read(&mut discard) {
+        if n < discard.len() {
+            break;
+        }
+    }
+
+    let _ = stream.set_write_timeout(Some(REJECT_TIMEOUT));
+    let response = plain_text_response(503, b"Too many connections");
+    let _ = stream.write_all(&format_http_response(&response));
 }
 
 /// Which of the three ways `handle_http_connection` can dispose of a
@@ -1707,5 +1768,115 @@ mod tests {
         assert_eq!(response.status, 200, "{:?}", response.body);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
         assert!(body["error"].is_null(), "{body}");
+    }
+
+    /// ADR 0005's both directions, at the counter itself rather than through
+    /// 65 real sockets - one bad connection past the cap would be slow to
+    /// prove wrong that way, and a cap that refused everything would still
+    /// pass a test that only tried the 65th.
+    #[test]
+    fn the_64th_reservation_succeeds_and_the_65th_is_refused() {
+        let active_connections = AtomicUsize::new(0);
+
+        for i in 0..MAX_CONNECTIONS {
+            assert!(
+                try_reserve_connection(&active_connections),
+                "connection {} of {MAX_CONNECTIONS} should still be within the cap",
+                i + 1
+            );
+        }
+        assert_eq!(active_connections.load(Ordering::SeqCst), MAX_CONNECTIONS);
+
+        assert!(
+            !try_reserve_connection(&active_connections),
+            "the connection past the cap must be refused"
+        );
+        assert_eq!(
+            active_connections.load(Ordering::SeqCst),
+            MAX_CONNECTIONS,
+            "a refused reservation must not leave the counter overcounted"
+        );
+
+        active_connections.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            try_reserve_connection(&active_connections),
+            "freeing a slot must let a new connection back in"
+        );
+    }
+
+    /// The one claim in this file that needs real timing rather than the
+    /// counter alone: a client that connects and sends nothing must not hold
+    /// up a second client's complete, well-formed request. Against the
+    /// pre-fix inline accept loop, the fast client's response would not
+    /// arrive until the stalled one's connection was done being handled.
+    #[test]
+    fn a_stalled_client_does_not_delay_a_concurrent_request() {
+        let server = Arc::new(memory_server());
+        let interrupt_count = server.interrupt_count.clone();
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a port")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let address = format!("127.0.0.1:{port}");
+
+        let server_for_thread = server.clone();
+        let address_for_thread = address.clone();
+        let server_thread = thread::spawn(move || {
+            let _ = server_for_thread.run_http(&address_for_thread);
+        });
+
+        // Give the accept loop a moment to bind before either client
+        // connects.
+        thread::sleep(Duration::from_millis(200));
+
+        let stalled_client = TcpStream::connect(&address).expect("connect stalled client");
+
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body,
+        );
+
+        let mut fast_client = TcpStream::connect(&address).expect("connect fast client");
+        fast_client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let started = std::time::Instant::now();
+        fast_client
+            .write_all(request.as_bytes())
+            .expect("write request");
+        let mut response = Vec::new();
+        fast_client
+            .read_to_end(&mut response)
+            .expect("a stalled sibling connection must not delay this one's response");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the fast client waited {:?}, as if it were queued behind the stalled one",
+            started.elapsed()
+        );
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("\"tools\""),
+            "expected a real tools/list result, got: {response}"
+        );
+
+        // Closes the stalled connection so its handler thread returns on
+        // EOF instead of running out its full 30-second read timeout, which
+        // `thread::scope` inside `run_http` would otherwise wait out before
+        // the join below can return.
+        drop(stalled_client);
+        interrupt_count.store(1, Ordering::SeqCst);
+        let _ = server_thread.join();
     }
 }
