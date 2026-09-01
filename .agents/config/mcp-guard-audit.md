@@ -1,5 +1,14 @@
 # MCP guard audit: which direction is tested
 
+> **A snapshot, not a live record.** Taken against `claude/mcp-http-transport`
+> at `da516ea` and `claude/mcp-v2-protocol` at `e3c31ec`. Both branches have
+> moved since. The gaps it found are tracked at
+> [#40](https://github.com/wommy/turso/issues/40), which is the record that
+> stays current; this table is the evidence behind it and the list of what was
+> checked and found clean, which is what stops the next sweep redoing the same
+> ground. Re-run the sweep rather than trusting these rows — the method is in
+> [`../workflows/periodic-sweeps.md`](../workflows/periodic-sweeps.md).
+
 Every place the MCP protocol layer or HTTP transport refuses input, checked
 against two questions: is there a test proving it refuses bad input, and a
 separate test proving it still accepts good input. `none` means neither
