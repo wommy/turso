@@ -242,6 +242,13 @@ func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args 
 		if err != nil {
 			return nil, err
 		}
+		// A nil statement means the rest of the string held no statement to
+		// run - only comments, or semicolons. There is nothing to execute and
+		// nothing left to advance past, so stop here rather than hand a nil
+		// statement to bindArgs and executeFully below.
+		if stmt == nil {
+			break
+		}
 		// Calculate absolute offset advance
 		offset += tail
 

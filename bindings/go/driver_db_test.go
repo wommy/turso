@@ -1443,6 +1443,18 @@ func TestMultiStatementExecution(t *testing.T) {
 		}
 	})
 
+	t.Run("NoStatementAtAll", func(t *testing.T) {
+		// SQLite treats SQL with nothing to compile as success, which
+		// bindings/c/src/lib.rs already relies on for sqlite3_prepare_v2.
+		// These reached executeFully with a nil statement and came back as
+		// "API misuse: got null pointer".
+		for _, sql := range []string{";", ";;;", "-- comment", "/* comment */", "  ", ""} {
+			if _, err := db.Exec(sql); err != nil {
+				t.Errorf("Exec(%q) should be a no-op, got: %v", sql, err)
+			}
+		}
+	})
+
 	t.Run("EmptyStatements", func(t *testing.T) {
 		_, err := db.Exec(`
 			CREATE TABLE test_empty (id INTEGER);;;
