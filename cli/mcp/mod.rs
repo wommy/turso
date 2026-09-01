@@ -68,6 +68,13 @@ impl TursoMcpServer {
     fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let id = request.id.clone();
 
+        // A `_meta` of the wrong shape is malformed whatever the method asks
+        // for, so it is refused before the two negotiating methods are
+        // excused the checks below.
+        if let Err(error) = request.check_meta_shape() {
+            return JsonRpcResponse::failure(id, error);
+        }
+
         // Version and capability checks do not apply to the two methods a
         // client uses to find out what we speak.
         let negotiating = matches!(request.method.as_str(), "initialize" | "server/discover");
@@ -233,6 +240,38 @@ mod tests {
             lenient["error"].is_null(),
             "a pre-v2 client has no capabilities field to send: {lenient}"
         );
+    }
+
+    /// A field of the wrong type reads as an absent one to `get` and
+    /// `as_str`, and an absent version is exactly how a pre-v2 client looks.
+    /// So without this the v2 client whose version we cannot parse is served
+    /// as pre-v2 and never told that what it sent was ignored.
+    #[test]
+    fn a_meta_field_of_the_wrong_type_is_refused_rather_than_read_as_absent() {
+        let server = memory_server();
+        let malformed = [
+            json!({ "_meta": PROTOCOL_V2 }),
+            json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": 20260728 } }),
+            json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": PROTOCOL_V2,
+                    "io.modelcontextprotocol/clientCapabilities": "none",
+                }
+            }),
+        ];
+
+        let codes: Vec<Value> = malformed
+            .iter()
+            .map(|params| {
+                answer(
+                    &server,
+                    json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": params }),
+                )["error"]["code"]
+                    .clone()
+            })
+            .collect();
+
+        assert_eq!(codes, vec![json!(INVALID_PARAMS); 3]);
     }
 
     #[test]
