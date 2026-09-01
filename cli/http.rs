@@ -1,9 +1,27 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+/// How long one request may take to arrive, however slowly a client feeds
+/// it in. A flat `set_read_timeout` on its own is not enough: it resets on
+/// every byte received, so a client trickling in one byte just before each
+/// timeout elapses can hold the connection open indefinitely. This is the
+/// real budget; `read_http_request` re-derives its own socket timeout from
+/// it instead of trusting whatever the caller set.
+const READ_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a single `read()` or `write()` may block before a caller's loop
+/// rechecks its deadline. Capping it well below the deadline itself means
+/// that check is reached again shortly after the budget runs out, instead of
+/// a call sitting inside one blocking read or write for the whole remaining
+/// budget while a client trickles in - or drains out - just enough bytes to
+/// keep it from failing.
+const IO_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct HttpResponse {
     pub status: u16,
@@ -17,11 +35,27 @@ pub struct HttpResponse {
 }
 
 pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    read_http_request_by(stream, READ_DEADLINE)
+}
+
+/// Split out from `read_http_request` so a test can hand it a deadline of a
+/// few hundred milliseconds instead of waiting out the real 30 seconds to
+/// prove a silent client is refused.
+fn read_http_request_by(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>> {
+    stream.set_read_timeout(Some(IO_POLL_TIMEOUT.min(deadline)))?;
+    let started = Instant::now();
     let mut buffer = [0u8; 8192];
     let mut request_data = Vec::new();
 
     loop {
-        let n = stream.read(&mut buffer)?;
+        if started.elapsed() > deadline {
+            return Err(anyhow!("HTTP request took too long to arrive"));
+        }
+        let n = match stream.read(&mut buffer) {
+            Ok(n) => n,
+            Err(e) if is_io_timeout(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
@@ -50,7 +84,14 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
         if let Some(content_length) = parse_content_length(&headers)? {
             let total_expected = request_end(header_end, content_length)?;
             while request_data.len() < total_expected {
-                let n = stream.read(&mut buffer)?;
+                if started.elapsed() > deadline {
+                    return Err(anyhow!("HTTP request took too long to arrive"));
+                }
+                let n = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(e) if is_io_timeout(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 if n == 0 {
                     break;
                 }
@@ -65,6 +106,51 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
     }
 
     Ok(request_data)
+}
+
+/// A read or write timing out is not a failure on its own: it just means the
+/// poll interval elapsed with no progress, so the caller's loop can recheck
+/// its real deadline instead of treating the timeout as the end of the world.
+fn is_io_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Writes `bytes` in small steps against an overall `deadline`, instead of
+/// trusting a single `write_all` bounded only by a per-write socket timeout.
+/// A client that drains a few bytes just before each write's own timeout
+/// elapses would keep every individual write nominally succeeding while the
+/// response as a whole never finishes - which, for a caller that serves one
+/// connection at a time, wedges every client behind it too. `interrupted` is
+/// checked the same way: a count above zero abandons a stalled write rather
+/// than waiting out the rest of the deadline.
+pub fn write_response_bounded(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Duration,
+    interrupted: &AtomicUsize,
+) -> Result<()> {
+    stream.set_write_timeout(Some(IO_POLL_TIMEOUT.min(deadline)))?;
+    let started = Instant::now();
+    let mut sent = 0;
+    while sent < bytes.len() {
+        if interrupted.load(Ordering::SeqCst) > 0 {
+            return Err(anyhow!("interrupted while writing the response"));
+        }
+        if started.elapsed() > deadline {
+            return Err(anyhow!("writing the response took too long"));
+        }
+        match stream.write(&bytes[sent..]) {
+            Ok(0) => return Err(anyhow!("connection closed while writing the response")),
+            Ok(n) => sent += n,
+            Err(e) if is_io_timeout(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    stream.flush()?;
+    Ok(())
 }
 
 fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
@@ -169,7 +255,6 @@ pub fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// Every status the MCP transport can answer with needs a reason phrase
     /// here, and nothing else in the suite would notice a missing one: the
@@ -294,5 +379,162 @@ mod tests {
     fn rejects_content_length_that_overflows() {
         assert!(request_end(0, usize::MAX).is_err());
         assert_eq!(request_end(10, 5).unwrap(), 19);
+    }
+
+    /// Mirrors what a caller used to set up by hand: a client that connects
+    /// and never sends a byte must be refused with a clear reason once the
+    /// deadline passes, rather than left to hang or read as a broken
+    /// connection. Uses a deadline of a few hundred milliseconds - the real
+    /// `READ_DEADLINE` is 30 seconds, and this only needs to prove the
+    /// budget is enforced, not spend 30 real seconds doing it.
+    #[test]
+    fn a_silent_client_is_refused_gracefully_once_the_deadline_passes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let client = TcpStream::connect(address).expect("connect");
+            // Never sends a byte, and stays connected well past the deadline
+            // below, instead of closing right away.
+            std::thread::sleep(Duration::from_secs(2));
+            drop(client);
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+
+        let error = read_http_request_by(&mut stream, Duration::from_millis(300))
+            .expect_err("a silent client is refused");
+
+        assert!(
+            error.to_string().contains("took too long"),
+            "expected a graceful refusal, got: {error}"
+        );
+    }
+
+    /// The other direction of the guard above: a client that is merely slow,
+    /// not silent, and finishes within its budget must still be served. Each
+    /// piece arrives further apart than `IO_POLL_TIMEOUT`, so the read loop
+    /// has to resume across more than one timed-out `read()` - but the whole
+    /// exchange still finishes well inside the deadline given here. Without
+    /// this, a deadline that fires on any pause at all, rather than one that
+    /// outlasts the budget, would pass every refusal test while refusing
+    /// every real client too.
+    #[test]
+    fn a_client_that_trickles_bytes_within_the_deadline_is_still_served() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let request = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nHELLO".to_vec();
+
+        std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            for chunk in request.chunks(request.len() / 3 + 1) {
+                stream.write_all(chunk).expect("write");
+                stream.flush().expect("flush");
+                std::thread::sleep(Duration::from_millis(700));
+            }
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+        let data = read_http_request_by(&mut stream, Duration::from_secs(5))
+            .expect("a slow but complete client must still be served");
+
+        let (_, _, _, body) = parse_http_request(&data).expect("request parses");
+        assert_eq!(body, b"HELLO");
+    }
+
+    #[test]
+    fn write_response_bounded_gives_up_once_the_deadline_passes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = TcpStream::connect(address).expect("connect"); // never reads
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let interrupted = AtomicUsize::new(0);
+
+        // Bigger than typical socket buffers, so the write below genuinely
+        // blocks instead of the whole payload being buffered by the kernel.
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = Instant::now();
+
+        let result = write_response_bounded(
+            &mut server_stream,
+            &payload,
+            Duration::from_millis(800),
+            &interrupted,
+        );
+
+        assert!(result.is_err(), "a stalled client must not block forever");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline should have cut the write off quickly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn write_response_bounded_gives_up_once_interrupted() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = TcpStream::connect(address).expect("connect"); // never reads
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let interrupted = AtomicUsize::new(0);
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                write_response_bounded(
+                    &mut server_stream,
+                    &payload,
+                    Duration::from_secs(30),
+                    &interrupted,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            interrupted.store(1, Ordering::SeqCst);
+
+            let result = handle.join().expect("the writer thread does not panic");
+            assert!(
+                result.is_err(),
+                "an interrupted caller must abandon a stalled write rather than wait out the deadline"
+            );
+        });
+    }
+
+    /// The other direction of the two guards above: a normal, fast write
+    /// still has to succeed and deliver exactly the bytes sent, or a caller
+    /// would be trading a slowloris hang for a guard that refuses everyone.
+    #[test]
+    fn write_response_bounded_delivers_a_normal_response() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let interrupted = AtomicUsize::new(0);
+
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        write_response_bounded(
+            &mut server_stream,
+            b"hello",
+            Duration::from_secs(5),
+            &interrupted,
+        )
+        .expect("a normal write must succeed");
+        drop(server_stream);
+
+        let received = client.join().expect("client thread does not panic");
+        assert_eq!(received, b"hello");
     }
 }
