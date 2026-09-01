@@ -41,6 +41,13 @@ decision.
   crate no branch here touches. Add `--allow unfulfilled-lint-expectations`.
 - **Never `cargo run`** — it rebuilds the workspace at default features and has
   exhausted this container's disk twice.
+- **A real MCP client is installable here.** `pip install mcp` (2.1.1) and
+  `npm view @modelcontextprotocol/sdk` (1.30.0) both reach their registries
+  through the proxy. Driving the server with one found two bugs in twenty
+  minutes that 118 tests had not — reproduction in
+  [#23](https://github.com/wommy/turso/issues/23). Reach for this before
+  writing another test from the spec text: our tests and our code come from the
+  same reading, so a shared misreading is invisible to both.
 
 ## The two live unknowns
 
