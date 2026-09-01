@@ -83,6 +83,41 @@ impl JsonRpcRequest {
         self.params.as_ref()?.get("_meta")
     }
 
+    /// The schema types `_meta` and the two required fields inside it, so a
+    /// value of the wrong type is a required field supplied malformed, which
+    /// the spec makes `-32602`. It has to be caught before anything reads
+    /// those fields: `get` and `as_str` report a wrong type as an absent
+    /// field, and an absent version is exactly how a pre-v2 client looks, so
+    /// a v2 client whose version we cannot parse would otherwise be served as
+    /// pre-v2 and never told that what it sent was ignored.
+    pub(crate) fn check_meta_shape(&self) -> Result<(), JsonRpcError> {
+        let Some(meta) = self.meta() else {
+            return Ok(());
+        };
+        let Some(meta) = meta.as_object() else {
+            return Err(malformed("params._meta", "an object"));
+        };
+        if meta
+            .get(META_PROTOCOL_VERSION)
+            .is_some_and(|version| !version.is_string())
+        {
+            return Err(malformed(
+                &format!("params._meta[\"{META_PROTOCOL_VERSION}\"]"),
+                "a string",
+            ));
+        }
+        if meta
+            .get(META_CLIENT_CAPABILITIES)
+            .is_some_and(|capabilities| !capabilities.is_object())
+        {
+            return Err(malformed(
+                &format!("params._meta[\"{META_CLIENT_CAPABILITIES}\"]"),
+                "an object",
+            ));
+        }
+        Ok(())
+    }
+
     /// A client that names no version is pre-v2, and is served as one.
     pub(crate) fn protocol_version(&self) -> Option<&str> {
         self.meta()?.get(META_PROTOCOL_VERSION)?.as_str()
@@ -125,6 +160,10 @@ impl JsonRpcRequest {
             ),
         ))
     }
+}
+
+fn malformed(path: &str, expected: &str) -> JsonRpcError {
+    JsonRpcError::new(INVALID_PARAMS, format!("{path} must be {expected}"))
 }
 
 impl JsonRpcResponse {
