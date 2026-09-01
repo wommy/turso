@@ -134,6 +134,15 @@ here, so this is inferred from the label, from eleven hours of zero starts,
 and from every completion in the session being an `ubuntu-*` job. If a
 blacksmith job ever completes, this section is wrong and should be deleted.
 
+**A `check_suite.completed` event here does not mean CI passed.** Its text
+says no third-party suite is still running or failed, and invites you to
+continue as though you had been waiting on CI. On this fork that condition is
+satisfied the moment the three GitHub-hosted suites finish, because the
+blacksmith suites are **cancelled**, and the event's own caveat excludes
+cancelled suites from what it covers. Two such events arrived on PR #1 whose
+blacksmith jobs were, without exception, cancelled. Read the runs, never the
+envelope.
+
 ## Definition of done
 
 Every watched PR is merged or closed. Until then the loop re-arms, including
