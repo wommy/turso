@@ -65,10 +65,10 @@ pay off across branches, so they can run less often.
 
 ## The config sweep, because nobody audits the auditor
 
-`.agents/` was 1,295 lines one morning, 1,209 after a consolidation pass that
-removed 86, and 1,621 by that evening. Every one of those 412 added lines was
-written by someone who had just finished arguing that documents rot when they
-grow. Consolidating once does not hold.
+A consolidation pass over `.agents/` once removed 86 lines. The rest of that
+same day added 412, every one of them written by someone who had just finished
+arguing that documents rot when they grow. Consolidating once does not hold,
+which is why this is a loop and not a task.
 
 Four checks, all cheap:
 
@@ -97,28 +97,20 @@ for the next sweep to find.
 
 ## Checkpoint
 
-**Only when a sweep finds something that changes the plan** — work that has to
-land before shipping, or a finding that reshapes a ticket. A clean sweep is
-recorded and not reported.
+**Only when a sweep changes the plan** — work that has to land before shipping,
+or a finding that reshapes a ticket. A clean sweep is recorded, not reported.
 
-## Push right
-
-Verify before raising. A sweep that forwards unverified agent claims moves
-work to the human instead of doing it. Ten claims in this effort turned out
-false on inspection.
+Verify before raising, per step 3. A sweep that forwards unverified agent claims
+moves work to the human instead of doing it, and ten claims in this effort have
+turned out false on inspection.
 
 ## Brief
 
-Under 200 words per sweep. What was found, what was checked and found clean,
-and what it changes. Never the raw output.
-
-## Definition of done
-
-Every sweep has reported, every finding is verified or explicitly marked
-unverified, and the clean results are written down.
+Under 200 words per sweep: what was found, what was checked and found clean, and
+what it changes. Never the raw output.
 
 ## OPEN
 
-Whether "roughly five slices" is the right count. It is a guess from one
-session in which eleven landed before anybody looked. The honest version of
-this number needs a second data point.
+Whether "roughly five slices" is the right count. It is a guess from one session
+in which eleven landed before anybody looked, and the honest version needs a
+second data point.

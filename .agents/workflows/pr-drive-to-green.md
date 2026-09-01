@@ -2,68 +2,54 @@
 
 ## Why this exists
 
-This loop is already running and has already degraded twice. Its scheduled
-prompt described a PR head four commits stale, listed a closed issue as open,
-claimed unstarted work that was finished, and asked for a decision on four
-defects fixed hours earlier. A firing against that text would have re-raised
-settled work.
+The loop degraded twice. Its scheduled prompt described a PR head four commits
+stale, listed a closed issue as open, and asked for a decision on four defects
+fixed hours earlier. A firing against that text would have re-raised settled
+work.
 
 A loop that carries its own context must maintain that context, or it decays
 into confident misinformation.
 
 ## Trigger
 
-**Schedule.** Roughly hourly while any pull request we own is open. Stops when
-every one is merged or closed.
-
-Not event-driven, deliberately: GitHub webhooks miss CI completions and merge
-state transitions, so a schedule is the backstop. Events, when they arrive, are
-a bonus that fires the loop early.
+**Schedule**, roughly hourly while any pull request we own is open; stops when
+every one is merged or closed. Not event-driven, deliberately — GitHub webhooks
+miss CI completions and merge-state transitions, so the schedule is the
+backstop and events are a bonus that fires it early.
 
 ## Steps
 
-1. Read the check runs for every open PR. Use `pull_request_read` with
-   `get_check_runs`; `get_status` returns an empty legacy list in this repo and
-   will read as "no CI".
+1. Read the check runs for every open PR: `pull_request_read` with
+   `get_check_runs`. **Not `get_status`** — it returns an empty legacy list here
+   and reads as "no CI".
 2. Classify each PR: **red**, **green**, **queued**, **conflicted**.
-3. `queued` is not a failure. Runners here back up for hours and routinely show
-   ninety-plus queued checks. Act only on a real `failure`, `timed_out` or
-   `cancelled` conclusion.
-4. For a red check, establish whether it is ours before fixing: does it name
-   code the diff touches, and is it red on the base branch too?
+3. `queued` is not a failure. Runners back up for hours and ninety-plus queued
+   checks is normal. Act only on `failure`, `timed_out` or `cancelled`.
+4. For a red check, establish it is ours before fixing: does it name code the
+   diff touches, and is it red on the base branch too?
 5. Fix, validate locally, push. One validated push beats three speculative ones.
-6. **Keep this loop's prompt free of state.** The first two versions carried
-   PR heads, test counts, disk figures and an issue list, and both rotted inside
-   an hour — the second one within an hour of being deliberately refreshed. The
-   remedy is not refreshing harder. It is what `implement-spec` says: communicate
-   through **context pointers**, never by duplicating what a pointer already
-   reaches. A prompt that names where state lives cannot go stale; a prompt that
-   copies state always will.
+6. Re-arm.
 
-   Only two kinds of thing belong in the prompt: pointers, and facts that do not
-   change (the `get_status`-returns-nothing trap, the pre-existing clippy failure
-   in a crate no branch here touches). If a line would be wrong an hour from now,
-   it is a pointer that has not been written yet.
-7. Re-arm.
+**The scheduled prompt carries pointers and nothing else.** Two versions of it
+copied PR heads, test counts and issue lists, and both rotted within the hour —
+the second within an hour of being deliberately refreshed. The remedy is not
+refreshing harder. Only two things belong in it: pointers, and facts that cannot
+go stale. If a line would be wrong an hour from now, it is a pointer nobody has
+written yet. The steps above live here, so the prompt points at this file rather
+than restating them.
 
 ## Checkpoint
 
 **Only for an ambiguous or architecturally significant failure.** A confident,
 small, in-scope fix is pushed without asking.
 
-Never checkpoint to say "nothing changed". A quiet loop must be silent, or it
+Never checkpoint to say "nothing changed" — a quiet loop must be silent, or it
 trains the human to ignore it.
 
 ## Push right
 
 Diagnose, reproduce, fix and validate before involving anyone. If the answer is
-"this was flaky and passed on re-run", the human never hears about it.
-
-## Brief
-
-Only when a checkpoint fires, or when a PR reaches green and mergeable for the
-first time. Under 150 words: which PR, which check, what failed, what was tried,
-and the decision needed.
+"flaky, passed on re-run", the human never hears about it.
 
 ## Two ways this loop dies quietly
 
