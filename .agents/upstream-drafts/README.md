@@ -16,12 +16,23 @@ the fork and cannot post upstream at all; a refusal from it says nothing about
 whether upstream is reachable, which is a mistake already made once
 ([#22](https://github.com/wommy/turso/issues/22)).
 
-The owner's standing decision:
+**Nothing here can be posted by an agent.** Both write endpoints on
+`tursodatabase/turso` return `403 Resource not accessible by integration`,
+for issues and for pull requests alike. `gh-mcp` authenticates as the owner's
+account but is an *integration* scoped to repositories where the app is
+installed, and upstream is not one — which is why reads work and writes do
+not. Measured, not assumed ([#22](https://github.com/wommy/turso/issues/22)).
 
-| Kind | Authority |
+So the deliverable is a paste-ready artifact, and a person posts it:
+
+| Kind | What "done" means |
 |---|---|
-| Bug report, or a factual comment on an existing issue | Send it. No checkpoint. |
-| Pull request, or anything asking a maintainer to do work | Ask first, every time. |
+| Bug report, or a comment on an existing issue | The exact text, verbatim and final, in a fork-side comment. No checkpoint needed to write it. |
+| Pull request | Branch pushed to the fork, a draft PR on the fork holding the body, and the cross-fork compare link. Ask before preparing one. |
+
+A pushed branch becomes an upstream pull request through GitHub's own
+cross-fork **Compare & pull request**, so the missing API access costs a click
+rather than the route.
 
 **Both kinds need an adversarial pass before they go**, one or two agents whose
 brief is to falsify the claim rather than to check it. Two axes have both paid
