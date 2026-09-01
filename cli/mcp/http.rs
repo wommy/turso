@@ -1,4 +1,6 @@
-use super::protocol::{JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH};
+use super::protocol::{
+    JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH, METHOD_NOT_FOUND,
+};
 use super::TursoMcpServer;
 use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
 use anyhow::Result;
@@ -10,9 +12,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-/// The MCP spec's single Streamable HTTP endpoint. Every method but POST,
-/// and every other path, answers 404 - a later slice tells 405 apart from
-/// it once a red test asks for that distinction.
+/// The MCP spec's single Streamable HTTP endpoint. Any other path answers
+/// 404 regardless of method; GET and DELETE to this one answer 405 instead,
+/// since this server implements neither the SSE stream a GET once opened nor
+/// the session a DELETE once closed, for any era it speaks (see
+/// `route_request`).
 const ENDPOINT_PATH: &str = "/mcp";
 
 pub struct HttpRequest {
@@ -80,20 +84,48 @@ impl TursoMcpServer {
         let request_data = read_http_request(&mut stream)?;
         let (method, path, headers, body) = parse_http_request(&request_data)?;
 
-        let response = if method == "POST" && path == ENDPOINT_PATH {
-            http_response_for(self, &HttpRequest { headers, body })
-        } else {
-            HttpResponse {
-                status: 404,
-                content_type: "text/plain".to_string(),
-                body: b"Not Found".to_vec(),
-                extra_headers: Vec::new(),
-            }
+        let response = match route_request(&method, &path) {
+            Route::Handle => http_response_for(self, &HttpRequest { headers, body }),
+            Route::MethodNotAllowed => plain_text_response(405, b"Method Not Allowed"),
+            Route::NotFound => plain_text_response(404, b"Not Found"),
         };
 
         stream.write_all(&format_http_response(&response))?;
         stream.flush()?;
         Ok(())
+    }
+}
+
+/// Which of the three ways `handle_http_connection` can dispose of a
+/// request without ever reaching `http_response_for`.
+///
+/// Kept as a pure function of method and path - no socket, no `TcpStream` -
+/// so the routing rules (as opposed to what `http_response_for` does once
+/// routed) can be asserted directly instead of only through a live listener.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Handle,
+    MethodNotAllowed,
+    NotFound,
+}
+
+fn route_request(method: &str, path: &str) -> Route {
+    if path != ENDPOINT_PATH {
+        return Route::NotFound;
+    }
+    match method {
+        "POST" => Route::Handle,
+        "GET" | "DELETE" => Route::MethodNotAllowed,
+        _ => Route::NotFound,
+    }
+}
+
+fn plain_text_response(status: u16, body: &'static [u8]) -> HttpResponse {
+    HttpResponse {
+        status,
+        content_type: "text/plain".to_string(),
+        body: body.to_vec(),
+        extra_headers: Vec::new(),
     }
 }
 
@@ -109,12 +141,36 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
     let body = server
         .handle_message(&String::from_utf8_lossy(&req.body))
         .unwrap_or_default();
+    let status = if is_method_not_found(&body) { 404 } else { 200 };
     HttpResponse {
-        status: 200,
+        status,
         content_type: "application/json".to_string(),
         body: body.into_bytes(),
         extra_headers: Vec::new(),
     }
+}
+
+/// The spec's `404` rule for an unimplemented RPC method (MUST, L271-273)
+/// singles out one JSON-RPC error among everything `handle_message` can
+/// return, so the status mapping has to look inside the response instead of
+/// keying off success or failure alone.
+///
+/// This parses, once, the very string `handle_message` already handed back -
+/// inspecting what we were given, not re-serializing our own output just to
+/// re-parse it. The alternative was to have `handle_message` return a typed
+/// outcome the transport could read without parsing at all; that would be
+/// cleaner, but it means changing `cli/mcp/mod.rs`'s public shape, and that
+/// module is layer C, open as PR #18 - a wider blast radius than this status-
+/// code slice should carry.
+fn is_method_not_found(body: &str) -> bool {
+    let Ok(response) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    response
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+        == Some(METHOD_NOT_FOUND as i64)
 }
 
 /// The MCP spec's DNS-rebinding defense: a browser-sent `Origin` that is
@@ -341,6 +397,65 @@ mod tests {
             .as_array()
             .expect("result carries a tools array");
         assert!(!tools.is_empty(), "tools array must not be empty");
+    }
+
+    /// The spec's MUST at L271-273: a method the server does not implement
+    /// is a 404, not the 200-with-embedded-error every other JSON-RPC
+    /// failure gets. `nonexistent/thing` reaches `handle_message` past every
+    /// header check by naming itself consistently in both places, so the
+    /// only thing left to produce the 404 is the method lookup itself.
+    #[test]
+    fn a_post_naming_an_unimplemented_method_returns_404_with_a_method_not_found_error() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "nonexistent/thing",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "nonexistent/thing".to_string())],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 404);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32601);
+    }
+
+    /// `route_request` is the pure decision `handle_http_connection` acts
+    /// on, asserted directly rather than through a live listener - see its
+    /// doc comment for why.
+    #[test]
+    fn get_to_the_mcp_endpoint_is_method_not_allowed() {
+        assert_eq!(route_request("GET", ENDPOINT_PATH), Route::MethodNotAllowed);
+    }
+
+    #[test]
+    fn delete_to_the_mcp_endpoint_is_method_not_allowed() {
+        assert_eq!(
+            route_request("DELETE", ENDPOINT_PATH),
+            Route::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn post_to_an_unknown_path_is_still_plain_not_found() {
+        assert_eq!(route_request("POST", "/nowhere"), Route::NotFound);
+    }
+
+    #[test]
+    fn get_to_an_unknown_path_is_plain_not_found_not_method_not_allowed() {
+        assert_eq!(route_request("GET", "/nowhere"), Route::NotFound);
+    }
+
+    #[test]
+    fn post_to_the_mcp_endpoint_is_handled() {
+        assert_eq!(route_request("POST", ENDPOINT_PATH), Route::Handle);
     }
 
     #[test]
