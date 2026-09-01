@@ -1,5 +1,6 @@
 use super::protocol::{
-    JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH, METHOD_NOT_FOUND,
+    JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH, INVALID_PARAMS,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use super::TursoMcpServer;
 use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
@@ -143,7 +144,7 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
     let body = server
         .handle_message(&String::from_utf8_lossy(&req.body))
         .unwrap_or_default();
-    let status = if is_method_not_found(&body) { 404 } else { 200 };
+    let status = http_status_for(&body);
     HttpResponse {
         status,
         content_type: "application/json".to_string(),
@@ -152,10 +153,19 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
     }
 }
 
-/// The spec's `404` rule for an unimplemented RPC method (MUST, L271-273)
-/// singles out one JSON-RPC error among everything `handle_message` can
-/// return, so the status mapping has to look inside the response instead of
-/// keying off success or failure alone.
+/// The status the spec ties to the JSON-RPC response `handle_message` just
+/// produced. A success (no `error`) is always `200`. Among failures, several
+/// codes each get a status of their own rather than the plain `200` a
+/// JSON-RPC failure otherwise carries: `METHOD_NOT_FOUND` is `404` (MUST,
+/// `streamable-http.mdx` L271-273); `INVALID_PARAMS` (MUST, `index.mdx`
+/// L380-382), `UNSUPPORTED_PROTOCOL_VERSION` (MUST, `streamable-http.mdx`
+/// L264-267 and `schema.mdx` L376), `HEADER_MISMATCH` (MUST,
+/// `streamable-http.mdx` L596-598), `INVALID_REQUEST`, and `PARSE_ERROR` are
+/// all `400`. `HEADER_MISMATCH` never actually reaches this function -
+/// `validate_headers` answers it before `handle_message` is even called -
+/// but the rule is listed here too so this mapping reads as the complete
+/// table rather than one case short of it. Everything else - any other code,
+/// or no error at all - keeps the `200` a JSON-RPC response gets by default.
 ///
 /// This parses, once, the very string `handle_message` already handed back -
 /// inspecting what we were given, not re-serializing our own output just to
@@ -164,15 +174,35 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
 /// cleaner, but it means changing `cli/mcp/mod.rs`'s public shape, and that
 /// module is layer C, open as PR #18 - a wider blast radius than this status-
 /// code slice should carry.
-fn is_method_not_found(body: &str) -> bool {
+///
+/// A notification has no response at all: `handle_message` gives back `None`,
+/// which `http_response_for` turns into an empty string before this function
+/// ever sees it. An empty string does not parse as JSON, so it falls through
+/// to the same `200` as any other unparseable or error-free body - unchanged
+/// from what a notification got before this function existed.
+fn http_status_for(body: &str) -> u16 {
     let Ok(response) = serde_json::from_str::<Value>(body) else {
-        return false;
+        return 200;
     };
-    response
+    let Some(code) = response
         .get("error")
         .and_then(|error| error.get("code"))
         .and_then(Value::as_i64)
-        == Some(METHOD_NOT_FOUND as i64)
+    else {
+        return 200;
+    };
+    if code == METHOD_NOT_FOUND as i64 {
+        404
+    } else if code == INVALID_PARAMS as i64
+        || code == UNSUPPORTED_PROTOCOL_VERSION as i64
+        || code == HEADER_MISMATCH as i64
+        || code == INVALID_REQUEST as i64
+        || code == PARSE_ERROR as i64
+    {
+        400
+    } else {
+        200
+    }
 }
 
 /// The MCP spec's DNS-rebinding defense: a browser-sent `Origin` that is
@@ -470,6 +500,66 @@ mod tests {
         assert_eq!(response.status, 404);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
         assert_eq!(body["error"]["code"], -32601);
+    }
+
+    /// The spec's MUST at `streamable-http.mdx` L264-267 and `schema.mdx`
+    /// L376: a client naming a protocol version we do not speak is a `400`,
+    /// carrying `UNSUPPORTED_PROTOCOL_VERSION` in the body.
+    #[test]
+    fn a_request_naming_an_unsupported_protocol_version_returns_400() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "1999-01-01" } },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "tools/list".to_string())],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION);
+    }
+
+    /// The spec's MUST at `index.mdx` L380-382: a v2 `tools/call` that omits
+    /// the client-capabilities `_meta` field it must carry is a `400`,
+    /// carrying `INVALID_PARAMS` in the body.
+    #[test]
+    fn a_v2_tools_call_missing_client_capabilities_returns_400() {
+        use super::super::protocol::PROTOCOL_V2;
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "list_tables",
+                "arguments": {},
+                "_meta": { "io.modelcontextprotocol/protocolVersion": PROTOCOL_V2 }
+            },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Name".to_string(), "list_tables".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], INVALID_PARAMS);
     }
 
     /// `route_request` is the pure decision `handle_http_connection` acts
@@ -777,7 +867,14 @@ mod tests {
 
         let response = http_response_for(&server, &req);
 
-        assert_eq!(response.status, 200);
+        // "café" is not a real tool, so this still fails past the header
+        // check - just as `INVALID_PARAMS`, `handle_call_tool`'s own answer
+        // for an unknown tool name, not as `HEADER_MISMATCH`. That is the
+        // fact this test is actually about: proving the decoded header
+        // reached `handle_message` at all, which a wrong decode would have
+        // stopped at `validate_headers` with `HEADER_MISMATCH` instead.
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_ne!(body["error"]["code"], HEADER_MISMATCH);
     }
 
     #[test]
@@ -925,7 +1022,15 @@ mod tests {
 
         let response = http_response_for(&server, &req);
 
-        assert_eq!(response.status, 200);
+        // "foo=?base64?Zm9v?=bar" is not a real tool, so this still fails
+        // past the header check - just as `INVALID_PARAMS`, `handle_call_
+        // tool`'s own answer for an unknown tool name, not as
+        // `HEADER_MISMATCH`. That is the fact this test is actually about:
+        // proving the literal header reached `handle_message` at all, which
+        // a wrong decode (mistaking this for the sentinel shape) would have
+        // stopped at `validate_headers` with `HEADER_MISMATCH` instead.
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_ne!(body["error"]["code"], HEADER_MISMATCH);
     }
 
     /// The end-to-end 403 cases live in tests/mcp_http_transport.rs, which
