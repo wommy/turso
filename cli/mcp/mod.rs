@@ -11,10 +11,20 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use turso_core::Connection;
 
+/// The connection a tool call runs against, and the path it was opened from.
+/// Kept behind one lock so the two can never disagree: `open_database` sets
+/// both together, and every tool call holds the lock for its whole duration,
+/// so a second client can never run a statement between another client's
+/// `execute` and its matching `changes()`, or between an `open_database` and
+/// the query that follows it.
+struct Session {
+    conn: Arc<Connection>,
+    db_path: Option<String>,
+}
+
 pub struct TursoMcpServer {
-    pub(crate) conn: Arc<Mutex<Arc<Connection>>>,
+    session: Mutex<Session>,
     pub(crate) interrupt_count: Arc<AtomicUsize>,
-    pub(crate) current_db_path: Arc<Mutex<Option<String>>>,
     /// Set by `--readonly`. The connection is opened read-only either way, but
     /// the server has to know as well: it advertises tools, and it can be asked
     /// to open a different database.
@@ -24,9 +34,11 @@ pub struct TursoMcpServer {
 impl TursoMcpServer {
     pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>, readonly: bool) -> Self {
         Self {
-            conn: Arc::new(Mutex::new(conn)),
+            session: Mutex::new(Session {
+                conn,
+                db_path: None,
+            }),
             interrupt_count,
-            current_db_path: Arc::new(Mutex::new(None)),
             readonly,
         }
     }
