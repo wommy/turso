@@ -908,7 +908,7 @@ mod tests {
         TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), false)
     }
 
-    fn query_arg(sql: &str) -> Option<Value> {
+    fn query_params(sql: &str) -> Option<Value> {
         Some(json!({ "query": sql }))
     }
 
@@ -928,7 +928,7 @@ mod tests {
 
     fn orders_dump(server: &TursoMcpServer) -> String {
         server
-            .execute_query(&query_arg(
+            .execute_query(&query_params(
                 "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
             ))
             .expect("dumping the table succeeds")
@@ -940,7 +940,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.update_data(&query_arg(
+        let result = server.update_data(&query_params(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         ));
 
@@ -966,7 +966,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.update_data(&query_arg(
+        let result = server.update_data(&query_params(
             "UPDATE bench_orders SET status='DONE; DELETE' WHERE order_id=1",
         ));
         let text = result.expect("a single UPDATE succeeds").text;
@@ -982,7 +982,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.insert_data(&query_arg(
+        let result = server.insert_data(&query_params(
             "INSERT INTO bench_orders VALUES (3, 'NEW', 3); DELETE FROM bench_orders WHERE order_id=2",
         ));
 
@@ -1000,7 +1000,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.delete_data(&query_arg(
+        let result = server.delete_data(&query_params(
             "DELETE FROM bench_orders WHERE order_id=1; DROP TABLE bench_orders",
         ));
 
@@ -1019,7 +1019,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.schema_change(&query_arg(
+        let result = server.schema_change(&query_params(
             "CREATE TABLE extra (id INTEGER); DELETE FROM bench_orders",
         ));
 
@@ -1037,7 +1037,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.execute_query(&query_arg(
+        let result = server.execute_query(&query_params(
             "SELECT order_id FROM bench_orders WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         ));
 
@@ -1054,7 +1054,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.update_data(&query_arg(
+        let result = server.update_data(&query_params(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1",
         ));
         let text = result.expect("a single UPDATE succeeds").text;
@@ -1076,24 +1076,26 @@ mod tests {
         for (tool, result, expected) in [
             (
                 "insert_data",
-                server.insert_data(&query_arg("DELETE FROM bench_orders WHERE order_id=1")),
+                server.insert_data(&query_params("DELETE FROM bench_orders WHERE order_id=1")),
                 "Only INSERT statements are allowed",
             ),
             (
                 "update_data",
-                server.update_data(&query_arg("INSERT INTO bench_orders VALUES (3, 'NEW', 3)")),
+                server.update_data(&query_params(
+                    "INSERT INTO bench_orders VALUES (3, 'NEW', 3)",
+                )),
                 "Only UPDATE statements are allowed",
             ),
             (
                 "delete_data",
-                server.delete_data(&query_arg(
+                server.delete_data(&query_params(
                     "UPDATE bench_orders SET status='X' WHERE order_id=1",
                 )),
                 "Only DELETE statements are allowed",
             ),
             (
                 "schema_change",
-                server.schema_change(&query_arg("DELETE FROM bench_orders WHERE order_id=1")),
+                server.schema_change(&query_params("DELETE FROM bench_orders WHERE order_id=1")),
                 "Only CREATE, ALTER, and DROP statements are allowed",
             ),
         ] {
@@ -1129,10 +1131,10 @@ mod tests {
     fn concurrent_tool_calls_see_their_own_changes_not_each_others() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE race_a (v INTEGER)"))
+            .schema_change(&query_params("CREATE TABLE race_a (v INTEGER)"))
             .expect("create race_a");
         server
-            .schema_change(&query_arg("CREATE TABLE race_b (v INTEGER)"))
+            .schema_change(&query_params("CREATE TABLE race_b (v INTEGER)"))
             .expect("create race_b");
 
         const ITERATIONS: usize = 500;
@@ -1141,7 +1143,7 @@ mod tests {
             let one_row_thread = scope.spawn(|| {
                 for _ in 0..ITERATIONS {
                     let result = server
-                        .insert_data(&query_arg("INSERT INTO race_a VALUES (1)"))
+                        .insert_data(&query_params("INSERT INTO race_a VALUES (1)"))
                         .expect("insert into race_a succeeds");
                     assert_eq!(
                         result.structured["changes"], 1,
@@ -1152,7 +1154,7 @@ mod tests {
             let two_row_thread = scope.spawn(|| {
                 for _ in 0..ITERATIONS {
                     let result = server
-                        .insert_data(&query_arg("INSERT INTO race_b VALUES (1), (2)"))
+                        .insert_data(&query_params("INSERT INTO race_b VALUES (1), (2)"))
                         .expect("insert into race_b succeeds");
                     assert_eq!(
                         result.structured["changes"], 2,
@@ -1339,19 +1341,19 @@ mod tests {
         for (tool, result) in [
             (
                 "insert_data",
-                server.insert_data(&query_arg("INSERT INTO t VALUES (1)")),
+                server.insert_data(&query_params("INSERT INTO t VALUES (1)")),
             ),
             (
                 "update_data",
-                server.update_data(&query_arg("UPDATE t SET x=1")),
+                server.update_data(&query_params("UPDATE t SET x=1")),
             ),
             (
                 "delete_data",
-                server.delete_data(&query_arg("DELETE FROM t")),
+                server.delete_data(&query_params("DELETE FROM t")),
             ),
             (
                 "schema_change",
-                server.schema_change(&query_arg("CREATE TABLE t (x)")),
+                server.schema_change(&query_params("CREATE TABLE t (x)")),
             ),
         ] {
             let refused = result.expect_err("{tool} must be refused under --readonly");
@@ -1386,11 +1388,11 @@ mod tests {
     fn a_query_stops_at_the_row_cap_and_says_that_it_did() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE many (n INTEGER)"))
+            .schema_change(&query_params("CREATE TABLE many (n INTEGER)"))
             .expect("create");
         for n in 0..5 {
             server
-                .insert_data(&query_arg(&format!("INSERT INTO many VALUES ({n})")))
+                .insert_data(&query_params(&format!("INSERT INTO many VALUES ({n})")))
                 .expect("insert");
         }
 
@@ -1408,7 +1410,7 @@ mod tests {
         );
 
         let whole = server
-            .execute_query(&query_arg("SELECT n FROM many"))
+            .execute_query(&query_params("SELECT n FROM many"))
             .expect("query succeeds");
         assert_eq!(whole.structured["row_count"], 5);
         assert_eq!(
@@ -1423,15 +1425,15 @@ mod tests {
     fn an_oversized_cell_is_shaped_so_it_cannot_pass_for_the_whole_value() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE big (t TEXT)"))
+            .schema_change(&query_params("CREATE TABLE big (t TEXT)"))
             .expect("create");
         let long = "x".repeat(MAX_CELL_BYTES * 2);
         server
-            .insert_data(&query_arg(&format!("INSERT INTO big VALUES ('{long}')")))
+            .insert_data(&query_params(&format!("INSERT INTO big VALUES ('{long}')")))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT t FROM big"))
+            .execute_query(&query_params("SELECT t FROM big"))
             .expect("query succeeds");
         let cell = &result.structured["rows"][0][0];
 
@@ -1473,17 +1475,19 @@ mod tests {
     fn a_multibyte_cell_is_cut_to_the_byte_budget_not_the_character_count() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE wide (t TEXT)"))
+            .schema_change(&query_params("CREATE TABLE wide (t TEXT)"))
             .expect("create");
         // Three bytes per character, so a character-based cut would keep
         // roughly three times the budget.
         let long = "\u{4e16}".repeat(MAX_CELL_BYTES);
         server
-            .insert_data(&query_arg(&format!("INSERT INTO wide VALUES ('{long}')")))
+            .insert_data(&query_params(&format!(
+                "INSERT INTO wide VALUES ('{long}')"
+            )))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT t FROM wide"))
+            .execute_query(&query_params("SELECT t FROM wide"))
             .expect("query succeeds");
         let cell = &result.structured["rows"][0][0];
 
@@ -1545,15 +1549,15 @@ mod tests {
     fn an_oversized_cell_is_cut_in_the_text_field_too() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE big (t TEXT)"))
+            .schema_change(&query_params("CREATE TABLE big (t TEXT)"))
             .expect("create");
         let long = "y".repeat(MAX_CELL_BYTES * 4);
         server
-            .insert_data(&query_arg(&format!("INSERT INTO big VALUES ('{long}')")))
+            .insert_data(&query_params(&format!("INSERT INTO big VALUES ('{long}')")))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT t FROM big"))
+            .execute_query(&query_params("SELECT t FROM big"))
             .expect("query succeeds");
 
         assert!(
@@ -1570,14 +1574,14 @@ mod tests {
     fn null_and_an_empty_string_are_not_the_same_cell() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE n (a TEXT)"))
+            .schema_change(&query_params("CREATE TABLE n (a TEXT)"))
             .expect("create");
         server
-            .insert_data(&query_arg("INSERT INTO n VALUES (NULL), ('')"))
+            .insert_data(&query_params("INSERT INTO n VALUES (NULL), ('')"))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT a FROM n"))
+            .execute_query(&query_params("SELECT a FROM n"))
             .expect("query succeeds");
 
         assert!(result.text.contains("NULL"), "{}", result.text);
@@ -1601,16 +1605,16 @@ mod tests {
     fn non_finite_floats_round_trip_distinguishably() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE nf (f REAL)"))
+            .schema_change(&query_params("CREATE TABLE nf (f REAL)"))
             .expect("create");
         server
-            .insert_data(&query_arg(
+            .insert_data(&query_params(
                 "INSERT INTO nf VALUES (1e999), (-1e999), (NULL)",
             ))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT f FROM nf"))
+            .execute_query(&query_params("SELECT f FROM nf"))
             .expect("query succeeds");
         let rows = &result.structured["rows"];
 
@@ -1636,14 +1640,14 @@ mod tests {
     fn an_ordinary_float_is_still_a_plain_json_number() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE f (v REAL)"))
+            .schema_change(&query_params("CREATE TABLE f (v REAL)"))
             .expect("create");
         server
-            .insert_data(&query_arg("INSERT INTO f VALUES (3.5)"))
+            .insert_data(&query_params("INSERT INTO f VALUES (3.5)"))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT v FROM f"))
+            .execute_query(&query_params("SELECT v FROM f"))
             .expect("query succeeds");
         let cell = &result.structured["rows"][0][0];
 
