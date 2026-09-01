@@ -176,26 +176,26 @@ Config for Matt Pocock's engineering skills (`github.com/mattpocock/skills`):
 
 This branch is **not for upstream**. It exists so the config is durable and
 reviewable somewhere, without putting it in a pull request Turso is meant to
-take. See `docs/adr/0001-agent-config-lives-on-its-own-branch.md`.
+take. See `.agents/adr/0001-agent-config-lives-on-its-own-branch.md`.
 
-Install the skills with `./scripts/bootstrap-agent-skills.sh`; they land in
+Install the skills with `.agents/bootstrap-skills.sh`; they land in
 `~/.claude/skills`, outside this repo. Full notes, including the contended
-`code-review` name, are in `docs/agents/README.md`.
+`code-review` name, are in `.agents/config/README.md`.
 
 ### Issue tracker
 
 GitHub issues on this fork, reached through `gh` locally or the `mcp__github__*`
 tools in a remote container; `.scratch/` holds drafts nobody else needs yet.
-See `docs/agents/issue-tracker.md` and
-`docs/adr/0003-one-tracker-two-spellings.md`.
+See `.agents/config/issue-tracker.md` and
+`.agents/adr/0003-one-tracker-two-spellings.md`.
 
 ### Triage labels
 
 The five canonical roles, kept as-is and all present on the fork. See
-`docs/agents/triage-labels.md`.
+`.agents/config/triage-labels.md`.
 
 ### Domain docs
 
-Single-context: one root `CONTEXT.md` and `docs/adr/`, with the read list
+Single-context: one root `CONTEXT.md` and `.agents/adr/`, with the read list
 pointing at the per-area guides already in `docs/agent-guides/`. See
-`docs/agents/domain.md`.
+`.agents/config/domain.md`.

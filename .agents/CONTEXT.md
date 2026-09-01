@@ -3,7 +3,7 @@
 Glossary for terms that have **no home in an existing guide**. Most of Turso's
 vocabulary already lives in `docs/agent-guides/` (storage format, WAL and
 transactions, MVCC, async I/O); defining a term twice guarantees one copy goes
-stale. See `docs/agents/domain.md` for the read order and for the rule about when
+stale. See `.agents/config/domain.md` for the read order and for the rule about when
 an area earns a glossary of its own.
 
 Written lazily, as terms actually get resolved.

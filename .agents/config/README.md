@@ -10,7 +10,7 @@ written by `/setup-matt-pocock-skills`.
 | `domain.md` | What to read before exploring, and why there is no `CONTEXT-MAP.md` |
 | `../../CONTEXT.md` | The glossary |
 | `../adr/` | Decisions |
-| `../../scripts/bootstrap-agent-skills.sh` | Reinstall the skills in a fresh container |
+| `../bootstrap-skills.sh` | Reinstall the skills in a fresh container |
 
 ## This branch is not for upstream
 
@@ -32,7 +32,7 @@ nothing touches the tracked `.claude/skills/` directory and nothing shows up in
 `git status`:
 
 ```bash
-./scripts/bootstrap-agent-skills.sh
+.agents/bootstrap-skills.sh
 ```
 
 That clones (or updates) the skills repo and runs its `link-skills.sh`. Because

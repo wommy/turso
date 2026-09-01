@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # The skills install into ~/.claude/skills and ~/.agents/skills, both outside
 # the repo, so they survive no container restart. This restores them in one
-# command. See docs/agents/README.md.
+# command. See .agents/config/README.md.
 
 CLONE="${AGENT_SKILLS_CLONE:-$HOME/mattpocock-skills}"
 REMOTE="https://github.com/mattpocock/skills.git"
@@ -32,4 +32,4 @@ echo "linked two-axis-review in both harness directories"
 
 echo
 echo "Done. Run /setup-matt-pocock-skills only if the repo config is missing;"
-echo "it is already committed on this branch under docs/agents/."
+echo "it is already committed on this branch under .agents/."

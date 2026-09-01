@@ -28,7 +28,7 @@ is already written rather than at new files duplicating it.
 2. **`CONTEXT.md`** at the repo root: the glossary, for terms with no home in a
    guide above.
 
-3. **`docs/adr/`**: decisions that touch the area you are about to work in.
+3. **`.agents/adr/`**: decisions that touch the area you are about to work in.
 
 If any of these don't exist, **proceed silently**. Don't flag their absence and
 don't suggest creating them upfront. `/domain-modeling` creates them lazily, when
@@ -49,7 +49,7 @@ The graduation rule, for when that stops being true:
 > An area earns its own `CONTEXT.md` when its guide defines a term that
 > **contradicts** another area's, not merely when the area is big.
 
-Same reasoning for ADRs: `docs/adr/` is root-only. Per-crate ADR directories
+Same reasoning for ADRs: `.agents/adr/` is root-only. Per-crate ADR directories
 would be splitting a directory that currently holds nothing.
 
 ## Use the glossary's vocabulary

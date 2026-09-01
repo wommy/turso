@@ -3,7 +3,7 @@
 The skills assume `gh`. Half our sessions do not have it: work happens both on a
 local machine and in a Claude Code remote container, where GitHub is reached
 through `mcp__github__*` tools instead. Rather than pick one and be wrong half
-the time, `docs/agents/issue-tracker.md` is organised by **operation** — create,
+the time, `.agents/config/issue-tracker.md` is organised by **operation** — create,
 read, list, comment, label, close — with both spellings against each, and the
 instruction to probe (`command -v gh`) rather than assume.
 
