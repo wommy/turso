@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -12,7 +12,10 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
-use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
+use crate::http::{
+    format_http_response, parse_http_request, read_http_request, write_response_bounded,
+    HttpResponse,
+};
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
@@ -38,6 +41,15 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+
+/// Total time a response may take to leave the socket. `read_http_request`'s
+/// own deadline covers the request side; without a matching one here, a
+/// client that stops reading its response would block `write_all` forever -
+/// and because this server handles one connection at a time (see `run`'s
+/// accept loop), that stalled write would wedge every other client too, the
+/// same way an unbounded read would. Longer than the read side because a
+/// pull-updates response can carry a whole database's worth of pages.
+const WRITE_DEADLINE: Duration = Duration::from_secs(120);
 
 pub struct TursoSyncServer {
     address: String,
@@ -158,10 +170,12 @@ impl TursoSyncServer {
         };
 
         let response_bytes = format_http_response(&http_response);
-        stream.write_all(&response_bytes)?;
-        stream.flush()?;
-
-        Ok(())
+        write_response_bounded(
+            &mut stream,
+            &response_bytes,
+            WRITE_DEADLINE,
+            &self.interrupt_count,
+        )
     }
 
     fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {
@@ -1168,7 +1182,7 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use turso_core::{Connection, DatabaseOpts, SqliteDialect};
 
     fn memory_sync_server() -> TursoSyncServer {
