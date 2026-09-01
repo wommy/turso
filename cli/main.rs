@@ -49,6 +49,30 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     mcp_server.run()
 }
 
+/// The MCP spec says a local server SHOULD bind loopback; the CLI's other
+/// listeners default their help text to 0.0.0.0, so a non-loopback bind here
+/// is deliberate on the user's part and only gets a warning, not a refusal.
+fn is_loopback_address(address: &str) -> bool {
+    address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback())
+}
+
+fn run_mcp_http_server(app: app::Limbo, address: String) -> anyhow::Result<()> {
+    if !is_loopback_address(&address) {
+        eprintln!(
+            "warning: --mcp-http is bound to {address}, which is not a loopback address; \
+             the MCP spec recommends a local server bind to 127.0.0.1"
+        );
+    }
+
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let mcp_server = TursoMcpServer::new(conn, interrupt_count, app.is_readonly());
+
+    mcp_server.run_http(&address)
+}
+
 fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
     let address = app.opts.sync_server_address.clone().unwrap();
     let conn = app.get_connection();
@@ -78,6 +102,9 @@ fn main() -> anyhow::Result<()> {
     let (mut app, _guard) = app::Limbo::new()?;
 
     if app.is_mcp_mode() {
+        if let Some(address) = app.mcp_http_address() {
+            return run_mcp_http_server(app, address);
+        }
         return run_mcp_server(app);
     }
     if app.is_sync_server_mode() {
