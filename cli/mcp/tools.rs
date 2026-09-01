@@ -604,8 +604,13 @@ impl TursoMcpServer {
                 .map_err(|e| format!("Failed to connect to database '{path}': {e}"))?
         };
 
-        *self.conn.lock().unwrap() = conn;
-        *self.current_db_path.lock().unwrap() = Some(path.clone());
+        // Both fields change together under one lock, so a concurrent tool
+        // call on another connection can never see this call's new
+        // connection paired with the old path, or vice versa.
+        let mut session = self.session.lock().unwrap();
+        session.conn = conn;
+        session.db_path = Some(path.clone());
+        drop(session);
 
         Ok(ToolOutput::new(
             format!("Successfully opened database: {path}"),
@@ -615,9 +620,10 @@ impl TursoMcpServer {
 
     fn current_database(&self) -> Result<ToolOutput, String> {
         let path = self
-            .current_db_path
+            .session
             .lock()
             .unwrap()
+            .db_path
             .clone()
             .unwrap_or_else(|| ":memory:".to_string());
         Ok(ToolOutput::new(
@@ -629,8 +635,9 @@ impl TursoMcpServer {
     fn list_tables(&self) -> Result<ToolOutput, String> {
         let query = "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1";
 
-        let conn = self.conn.lock().unwrap().clone();
-        let mut rows = conn
+        let session = self.session.lock().unwrap();
+        let mut rows = session
+            .conn
             .query(query)
             .map_err(|e| format!("Error querying database: {e}"))?
             .ok_or_else(|| "No results returned from the query".to_string())?;
@@ -662,8 +669,9 @@ impl TursoMcpServer {
         // table_xinfo rather than table_info: the latter hides generated columns.
         let query = format!("PRAGMA table_xinfo({table_name})");
 
-        let conn = self.conn.lock().unwrap().clone();
-        let mut rows = conn
+        let session = self.session.lock().unwrap();
+        let mut rows = session
+            .conn
             .query(&query)
             .map_err(|e| format!("Error querying database: {e}"))?
             .ok_or_else(|| format!("Table '{table_name}' not found"))?;
@@ -732,8 +740,9 @@ impl TursoMcpServer {
     fn execute_query(&self, arguments: &Option<Value>) -> Result<ToolOutput, String> {
         let query = validated_query(arguments, StmtClass::Select)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        let mut rows = conn
+        let session = self.session.lock().unwrap();
+        let mut rows = session
+            .conn
             .query(query)
             .map_err(|e| format!("Error executing query: {e}"))?
             .ok_or_else(|| "No results returned from the query".to_string())?;
@@ -807,10 +816,16 @@ impl TursoMcpServer {
         self.refuse_if_readonly("INSERT")?;
         let query = validated_query(arguments, StmtClass::Insert)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        conn.execute(query)
+        // `changes()` is a counter on the connection itself, set at the end
+        // of whichever statement last ran on it - so it has to be read
+        // before another client's tool call can run a statement of its own,
+        // which is exactly what holding `session` for both calls guarantees.
+        let session = self.session.lock().unwrap();
+        session
+            .conn
+            .execute(query)
             .map_err(|e| format!("Error executing INSERT: {e}"))?;
-        let changes = conn.changes();
+        let changes = session.conn.changes();
         Ok(ToolOutput::new(
             format!("INSERT successful. {changes} row(s) changed."),
             json!({ "changes": changes }),
@@ -821,10 +836,12 @@ impl TursoMcpServer {
         self.refuse_if_readonly("UPDATE")?;
         let query = validated_query(arguments, StmtClass::Update)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        conn.execute(query)
+        let session = self.session.lock().unwrap();
+        session
+            .conn
+            .execute(query)
             .map_err(|e| format!("Error executing UPDATE: {e}"))?;
-        let changes = conn.changes();
+        let changes = session.conn.changes();
         Ok(ToolOutput::new(
             format!("UPDATE successful. {changes} row(s) changed."),
             json!({ "changes": changes }),
@@ -835,10 +852,12 @@ impl TursoMcpServer {
         self.refuse_if_readonly("DELETE")?;
         let query = validated_query(arguments, StmtClass::Delete)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        conn.execute(query)
+        let session = self.session.lock().unwrap();
+        session
+            .conn
+            .execute(query)
             .map_err(|e| format!("Error executing DELETE: {e}"))?;
-        let changes = conn.changes();
+        let changes = session.conn.changes();
         Ok(ToolOutput::new(
             format!("DELETE successful. {changes} row(s) changed."),
             json!({ "changes": changes }),
@@ -849,10 +868,12 @@ impl TursoMcpServer {
         self.refuse_if_readonly("schema change")?;
         let query = validated_query(arguments, StmtClass::Schema)?;
 
-        let conn = self.conn.lock().unwrap().clone();
-        conn.execute(query)
+        let session = self.session.lock().unwrap();
+        session
+            .conn
+            .execute(query)
             .map_err(|e| format!("Error executing schema change: {e}"))?;
-        let changes = conn.changes();
+        let changes = session.conn.changes();
         Ok(ToolOutput::new(
             format!("Schema change successful. {changes} row(s) changed."),
             json!({ "changes": changes }),
@@ -864,6 +885,7 @@ impl TursoMcpServer {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::thread;
 
     fn memory_server() -> TursoMcpServer {
         let (_io, conn) =
@@ -877,7 +899,7 @@ mod tests {
     }
 
     fn seed_bench_orders(server: &TursoMcpServer) {
-        let conn = server.conn.lock().unwrap().clone();
+        let conn = server.session.lock().unwrap().conn.clone();
         conn.execute(
             "CREATE TABLE bench_orders (
                 order_id INTEGER PRIMARY KEY,
@@ -1026,6 +1048,60 @@ mod tests {
         assert!(orders_dump(&server).contains("1 | DONE | 1"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
     }
+
+    /// `changes()` is one counter on the shared connection, overwritten by
+    /// whichever statement last ran. Two threads sharing a server must each
+    /// see their own write's count, never a count left behind by the other
+    /// thread's write landing in between this thread's own execute and its
+    /// read of `changes()`.
+    ///
+    /// No client can reach this today over the stdio transport, which reads
+    /// and dispatches one line at a time, so two tool calls never actually
+    /// overlap in production yet - that only becomes reachable once
+    /// connection handling stops being one-at-a-time. Called directly like
+    /// this, from two threads sharing one server, the race is real right
+    /// now: against the lock-dropped-early code this reliably reports one
+    /// thread's insert with the other's row count instead of its own.
+    #[test]
+    fn concurrent_tool_calls_see_their_own_changes_not_each_others() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE race_a (v INTEGER)"))
+            .expect("create race_a");
+        server
+            .schema_change(&query_arg("CREATE TABLE race_b (v INTEGER)"))
+            .expect("create race_b");
+
+        const ITERATIONS: usize = 500;
+
+        thread::scope(|scope| {
+            let one_row_thread = scope.spawn(|| {
+                for _ in 0..ITERATIONS {
+                    let result = server
+                        .insert_data(&query_arg("INSERT INTO race_a VALUES (1)"))
+                        .expect("insert into race_a succeeds");
+                    assert_eq!(
+                        result.structured["changes"], 1,
+                        "a one-row insert must report its own one row changed"
+                    );
+                }
+            });
+            let two_row_thread = scope.spawn(|| {
+                for _ in 0..ITERATIONS {
+                    let result = server
+                        .insert_data(&query_arg("INSERT INTO race_b VALUES (1), (2)"))
+                        .expect("insert into race_b succeeds");
+                    assert_eq!(
+                        result.structured["changes"], 2,
+                        "a two-row insert must report its own two rows changed"
+                    );
+                }
+            });
+            one_row_thread.join().expect("thread does not panic");
+            two_row_thread.join().expect("thread does not panic");
+        });
+    }
+
     fn call(server: &TursoMcpServer, name: &str, arguments: Value) -> Value {
         let raw = server
             .handle_message(
