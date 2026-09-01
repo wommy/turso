@@ -41,34 +41,27 @@ made here, on this branch.
 ## The skills
 
 Matt Pocock's engineering skills (`github.com/mattpocock/skills`) are what most
-of `config/` configures; `/setup-matt-pocock-skills` wrote the first draft of it.
-Reinstall them in a fresh container with:
+of `config/` configures. Reinstall them in a fresh container with
+`.agents/bootstrap-skills.sh`, which clones the repo and runs its
+`link-skills.sh`. That symlinks each skill into `~/.claude/skills` and
+`~/.agents/skills` — both outside this repo, so the tracked `.claude/skills/` is
+untouched and `git status` stays clean, and `git pull` in the clone updates all
+of them at once.
 
-```bash
-.agents/bootstrap-skills.sh
-```
+Three things that are not obvious:
 
-That clones the repo and runs its `link-skills.sh`, which symlinks every skill
-into `~/.claude/skills` and `~/.agents/skills` — both outside this repo, so the
-tracked `.claude/skills/` directory is untouched and `git status` stays clean.
-Because each skill is a symlink into one clone, `git pull` there updates all of
-them at once.
-
-Three things to know:
-
-- **`link-skills.sh` links the `in-progress/` skills too** — `implement-spec`,
-  `loop-me`, `retro`, `writing-beats`, `writing-fragments`, `writing-shape`,
-  `setup-ts-deep-modules`, `claude-handoff`. Only `deprecated/` is excluded. They
-  are the author's work in progress, not part of the documented flow.
+- **`in-progress/` skills get linked too** — `implement-spec`, `loop-me`,
+  `retro`, `writing-beats`, `writing-fragments`, `writing-shape`,
+  `setup-ts-deep-modules`, `claude-handoff`. Only `deprecated/` is excluded.
+  They are the author's work in progress, not part of the documented flow.
 - **Install from source only.** The `mattpocock-skills` plugin is enabled on this
-  account but has never materialised in a remote container. If it ever does, the
-  repo's README warns that having both gives you every skill twice.
+  account but has never materialised in a remote container, and having both
+  gives you every skill twice.
 - **`two-axis-review` always means Matt's `code-review`** — Standards and Spec as
   parallel subagents whose findings are never merged. The harness ships its own
-  `code-review` built in, with no file on disk to rename or move out of the way,
-  so the alias goes on Matt's. Ask for the built-in by what it does (a
-  correctness pass, `--fix`, `--comment`) and it is still there.
+  `code-review` with no file on disk to rename, so the alias goes on Matt's. Ask
+  for the built-in by what it does (`--fix`, `--comment`) and it is still there.
 
-`.scratch/` is the draft layer for anything not worth a ticket. It is gitignored,
-so it appears in no branch and dies with the container; anything another person
-must act on gets promoted to a GitHub issue.
+`.scratch/` is the draft layer for anything not worth a ticket. It is gitignored
+and dies with the container; anything another person must act on becomes an
+issue.

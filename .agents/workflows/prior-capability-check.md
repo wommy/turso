@@ -55,32 +55,27 @@ upstream, while the answer can still change what gets sent.
 
 ## Checkpoint
 
-**Only when step 5 is reached.** Nothing found means no interruption — the
-common case must be free, or the loop gets skipped.
+**Only when something is found.** Nothing found means no interruption — the
+common case has to be free, or the loop gets skipped.
 
-## Push right
-
-Do the whole search *and* the reuse assessment before asking anything. The
-question put to the human is never "did you know this exists?" but "here is what
-exists, here is what reuse costs, here is what duplication costs — which?"
+Do the whole search *and* the reuse assessment first. The question put to a
+human is never "did you know this exists?" but "here is what exists, here is
+what reuse costs, here is what duplication costs — which?"
 
 ## Brief
 
-Under 200 words. Never the raw search output.
+Under 200 words, never the raw search output:
 
-- **What exists**, with repository, path and one line on what it does.
-- **How close it is**, using the four classifications above.
-- **Cost of reuse** — extraction, coordination, or a dependency we would take on.
+- **What exists** — repository, path, one line on what it does.
+- **How close it is**, by the four classifications above.
+- **Cost of reuse** — extraction, coordination, or a dependency taken on.
 - **Cost of duplication** — what drifts, and who finds out later.
 - **A recommendation**, not a menu.
 
-## Definition of done
-
-The brief is delivered, or the search came back empty and that is recorded next
-to the decision. Recording the empty result matters: it is what stops the next
-person repeating the search.
+An empty result is still a deliverable: record it next to the decision, or the
+next person repeats the search.
 
 ## OPEN
 
-How far the organisational search should reach when the org has many
-repositories and most are irrelevant. Currently unbounded, which will not scale.
+How far the organisational search should reach when most of the org's
+repositories are irrelevant. Currently unbounded, which will not scale.

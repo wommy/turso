@@ -12,11 +12,17 @@ from one that rejects everything.
 
 ## Why this needs recording
 
-Both failure modes have happened here, and the detail is in
-[`background-agents.md`](../config/background-agents.md#negative-proof-has-to-isolate-the-test):
-a header-cap test padded so far past the cap that the *old* code caught it first,
-so it passed without the fix; and a duplicate-`Content-Length` guard that needed
-a companion test proving identical duplicates are still accepted.
+Both failure modes have happened here.
+
+A header-cap test padded to 40 KiB against a 32 KiB cap passed without the fix,
+because the padding was so far past the cap that the *old* check caught it on an
+earlier read and the overshoot the fix addresses was never exercised. At 33 KiB
+it fails without the fix and passes with it — **a test can be wrong by being too
+extreme, not only too weak.**
+
+A duplicate-`Content-Length` guard needed a companion test proving identical
+duplicates are still accepted, without which nothing distinguished it from a
+guard refusing every repeat.
 
 ## What this does not demand
 
