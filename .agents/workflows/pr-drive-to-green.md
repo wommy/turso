@@ -23,11 +23,12 @@ backstop and events are a bonus that fires it early.
    `get_check_runs`. **Not `get_status`** — it returns an empty legacy list here
    and reads as "no CI".
 2. Classify each PR: **red**, **green**, **queued**, **conflicted**.
-3. `queued` is not a failure. Runners back up for hours and ninety-plus queued
-   checks is normal. Act only on `failure` or `timed_out`. A `cancelled` run is
-   worth one glance at its head SHA: cancelled on a SHA the branch has moved
-   past is the concurrency group doing its job, and only a cancellation on the
-   current head is a real signal.
+3. `queued` is not a failure, and on this fork most of it is not temporary
+   either — see **CI cannot go green here** below. Act only on `failure` or
+   `timed_out`. A `cancelled` run is worth one glance at its head SHA:
+   cancelled on a SHA the branch has moved past is the concurrency group
+   doing its job, and only a cancellation on the current head is a real
+   signal.
 4. **Check each stacked branch contains its base's head.** A PR stacked on
    another branch does not follow that branch when it moves, so its diff and
    its CI can both be green while missing the fix that just landed underneath
@@ -84,6 +85,42 @@ what a pointer says, check that it is current - an `updated_at`, a supersession
 notice, a head SHA that matches. That is the same discipline
 `../config/verify-agent-claims.md` demands of a subagent report, and there is no
 reason a document gets a pass a report would not.
+
+## CI cannot go green here, and that is not a backlog
+
+Three workflows complete on a pull request in this fork: `aristo`, `Release`
+and `Fossier PR Check`. Nothing else ever has. Every substantive suite - Rust,
+Python, Java, Dotnet, SQL Tests, Conformance, C compat, the simulators, the
+fuzzers - only ever leaves the queue by being **cancelled** when a newer push
+supersedes it.
+
+The cause is the runner label, not load. 54 job definitions in
+`.github/workflows/` say `runs-on: blacksmith-4vcpu-ubuntu-2404`. Blacksmith is
+a third-party runner fleet the upstream organisation pays for, and a fork does
+not inherit it. The three that pass are the three on `ubuntu-latest` or
+`ubuntu-22.04`, which GitHub hosts. Runs on `claude/http-framing-fixes` have
+been queued over eleven hours.
+
+So **"waiting on CI" is not a state this fork can leave**, and any plan whose
+next step is "once CI is green" is waiting on something that will not happen.
+Green upstream is still meaningful; green here is not available.
+
+What this loop can still detect, and should:
+
+- a `failure` or `timed_out` in one of the three that do run
+- a merge conflict against the base branch
+- a stacked branch falling behind its base (step 4)
+- review comments
+
+What it must not do is treat a queued blacksmith job as pending news. Verify
+locally instead: `cargo test`, `cargo clippy` and `cargo fmt` are the real gate
+on this fork, and `../config/build-workflow.md` says how to run them without
+exhausting the disk.
+
+The one thing not checked: the runner registry itself is not visible from
+here, so this is inferred from the label, from eleven hours of zero starts,
+and from every completion in the session being an `ubuntu-*` job. If a
+blacksmith job ever completes, this section is wrong and should be deleted.
 
 ## Definition of done
 
