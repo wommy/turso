@@ -154,10 +154,19 @@ envelope.
 These also **replay on historical commits**. Four arrived in one evening
 carrying `head_sha` values that were ancestors of the branch head, not the
 head itself - one of them a commit from the previous day. So the first check
-is the cheapest one: if `git merge-base --is-ancestor <event sha> <branch
-head>` succeeds and the head is one you have already looked at, the event is
-about a commit that has been superseded and there is nothing behind it. Only
-an event whose SHA *is* the current head is worth pulling the runs for.
+is the cheapest one: `git merge-base --is-ancestor <event sha> <branch head>`.
+It has three answers, not two.
+
+- **Ancestor**, and the head is one you have already looked at: superseded,
+  nothing behind it, stop.
+- **Is the head**: the only case worth pulling the runs for.
+- **Neither** — the SHA is not reachable from the branch at all. A rebase or a
+  force-push dropped that commit, so the question is not about CI, it is
+  whether the *change* survived. Read the commit, then look for its content in
+  the current tree by name rather than by SHA. One arrived carrying a real
+  truncation fix; `git branch -a --contains` named no ref, and the fix and its
+  test turned out to be alive under a different commit. Had they not been, the
+  event would have been the only warning that a fix had been lost.
 
 ## Definition of done
 
