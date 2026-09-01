@@ -217,10 +217,9 @@ A request that carries an `id` gets `200` with the JSON-RPC response above; a no
 
 ### Limitations
 
-- **Only a client speaking the `2026-07-28` MCP revision works today.** Every request needs an `Mcp-Method` header (and, for `tools/call`, `resources/read`, and `prompts/get`, a matching `Mcp-Name` header) naming the JSON-RPC method in the body - a rule this revision defines, and no earlier one does. The official MCP SDK, and any other client that opens with a plain `initialize` handshake, sends neither header and gets a `400` back before its request is ever answered. This is a known defect, tracked as issue #44; until it is fixed, `--mcp-http` cannot serve a legacy MCP client.
-- **One connection at a time.** Each request is handled inline on the accept loop, with a 30-second read timeout. A client that opens a connection and stalls blocks every other request for up to that long.
+- **One connection at a time.** Each request is handled inline on the accept loop, with a 30-second read timeout that resets on every byte received. A client that opens a connection and stalls blocks every other request, and one that trickles bytes slowly holds it open indefinitely. Tracked as issue #46.
 
-The stdio transport (`--mcp`) has neither restriction and is the one to use with an existing MCP client today.
+The stdio transport (`--mcp`) has neither restriction.
 
 ## Example Session
 
@@ -258,8 +257,11 @@ Here's an example of using the MCP server:
 - Check that tables and columns exist
 - Ensure you have write permissions if modifying data
 
-### An HTTP client gets 400 on its first request
-See [Limitations](#limitations) above - this is issue #44, not a configuration problem. Use `--mcp` (stdio) until it is fixed, or confirm your client sends `Mcp-Method`/`Mcp-Name` headers per the `2026-07-28` revision.
+### An HTTP client gets 400 on a request
+
+Check which kind. A request declaring `2026-07-28` in `params._meta` must carry `MCP-Protocol-Version`, `Mcp-Method`, and — for `tools/call` — `Mcp-Name`, each matching the body; a mismatch or omission is `400` with JSON-RPC error `-32020`.
+
+A client handshaking with `initialize` is served without any of those headers, so a `400` there is not about headers. Read the JSON-RPC `error.code` in the body: `-32602` means a malformed or missing required `_meta` field, `-32022` a protocol revision this server does not speak.
 
 ## See Also
 

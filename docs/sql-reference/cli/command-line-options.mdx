@@ -132,7 +132,7 @@ tursodb --mcp-http 127.0.0.1:8081 mydata.db
 ```
 
 <Warning>
-This currently only works with a client speaking the `2026-07-28` MCP revision - run `.manual mcp` in the shell for details and limitations.
+Serves both the `2026-07-28` revision and the older `initialize` handshake. Connections are handled one at a time - run `.manual mcp` in the shell for details and limitations.
 </Warning>
 
 ### `--sync-server <ADDRESS>`

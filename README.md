@@ -261,7 +261,7 @@ Start the MCP server with:
 tursodb your_database.db --mcp
 ```
 
-An HTTP transport is also available via `--mcp-http <ADDRESS>`, but currently only works with a client speaking the `2026-07-28` MCP revision - see `.manual mcp` in the shell for details.
+An HTTP transport is also available via `--mcp-http <ADDRESS>`, serving both the `2026-07-28` revision and the older `initialize` handshake - see `.manual mcp` in the shell for details.
 
 ### Configuration
 
