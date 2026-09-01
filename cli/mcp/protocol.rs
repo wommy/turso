@@ -127,7 +127,14 @@ impl JsonRpcRequest {
         self.meta()?.get(META_PROTOCOL_VERSION)?.as_str()
     }
 
-    fn declares_v2(&self) -> bool {
+    /// The dual-era fork a server selects behavior from (MUST,
+    /// `basic/versioning.mdx` L175-180): true for a request carrying modern
+    /// per-request `_meta`, false for everything else, `initialize` included.
+    /// Also used by the HTTP transport to scope its `2026-07-28`-only
+    /// routing headers the same way this module scopes `clientCapabilities`
+    /// below - a client that has not declared this revision has no header to
+    /// check.
+    pub(crate) fn declares_v2(&self) -> bool {
         self.protocol_version() == Some(PROTOCOL_V2)
     }
 
