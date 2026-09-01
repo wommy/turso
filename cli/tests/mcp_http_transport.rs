@@ -73,7 +73,7 @@ fn a_post_of_tools_list_returns_200_with_a_non_empty_tools_array() {
 
     let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n{}",
         payload.len(),
         payload
     );

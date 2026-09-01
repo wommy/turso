@@ -21,6 +21,7 @@ pub(crate) const INVALID_REQUEST: i32 = -32600;
 pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const INVALID_PARAMS: i32 = -32602;
 pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+pub(crate) const HEADER_MISMATCH: i32 = -32020;
 
 /// The tool list cannot change while the server runs, so a client may hold it
 /// for as long as it likes.

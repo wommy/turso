@@ -98,14 +98,15 @@ fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
 }
 
-pub fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
-    let header_end = find_header_end(data, 0).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
-    let headers = String::from_utf8_lossy(&data[..header_end]);
+/// Method, path, headers (in wire order, name unmangled), and body.
+type ParsedHttpRequest = (String, String, Vec<(String, String)>, Vec<u8>);
 
-    let first_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("Empty request"))?;
+pub fn parse_http_request(data: &[u8]) -> Result<ParsedHttpRequest> {
+    let header_end = find_header_end(data, 0).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
+    let headers_text = String::from_utf8_lossy(&data[..header_end]);
+
+    let mut lines = headers_text.lines();
+    let first_line = lines.next().ok_or_else(|| anyhow!("Empty request"))?;
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
     if parts.len() < 2 {
@@ -114,9 +115,13 @@ pub fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
 
     let method = parts[0].to_string();
     let path = parts[1].to_string();
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .collect();
     let body = data[header_end + 4..].to_vec();
 
-    Ok((method, path, body))
+    Ok((method, path, headers, body))
 }
 
 pub fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
@@ -222,7 +227,7 @@ mod tests {
         let request = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nHELLOEXTRA".to_vec();
 
         let data = serve_one_request(request).expect("a well-formed request is read");
-        let (_, _, body) = parse_http_request(&data).expect("request parses");
+        let (_, _, _, body) = parse_http_request(&data).expect("request parses");
 
         assert_eq!(body, b"HELLO", "body must stop at Content-Length");
     }

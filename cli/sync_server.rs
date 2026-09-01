@@ -116,7 +116,7 @@ impl TursoSyncServer {
 
         let request_data = read_http_request(&mut stream)?;
 
-        let (method, path, body) = parse_http_request(&request_data)?;
+        let (method, path, _headers, body) = parse_http_request(&request_data)?;
         info!("Request: {} {}", method, path);
 
         let response = match (method.as_str(), path.as_str()) {
