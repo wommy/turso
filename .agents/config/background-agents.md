@@ -65,6 +65,12 @@ caught a false claim in a brief twice.
   rather than the code that was. Paste only when there is no name to point
   at: a shape you want that does not exist yet, or the exact words of a spec
   clause.
+- **Never ask an agent to edit anything under `.agents-ref`.** It is a symlink
+  into `claude/agent-config`, so the edit lands in another repository, outside
+  the commit the agent is building and possibly on top of another agent's work.
+  Point at an ADR to be *read*; if the work implies an ADR needs updating, have
+  the agent report that and do it yourself. Say so in the brief — an agent told
+  to "update the ADR as part of your commit" will try.
 - **One agent per worktree.** Not per file, and not per behaviour: two agents in
   one checkout collide on the index. One of them stashed two others' work when I
   wrongly read its commits as finished. Give each its own worktree and name the

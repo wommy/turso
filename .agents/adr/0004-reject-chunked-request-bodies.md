@@ -1,16 +1,24 @@
 # Reject chunked request bodies with 411 rather than de-chunking them
 
-The MCP HTTP transport will refuse a request carrying `Transfer-Encoding:
-chunked` with `411 Length Required`, and understand `Content-Length` and
-nothing else.
+The MCP HTTP transport refuses a request carrying `Transfer-Encoding: chunked`
+with `411 Length Required`. It understands `Content-Length` and nothing else.
 
-**Decided, not yet built.** No `Transfer-Encoding`, `chunked` or `411` appears
-anywhere in `cli/` today; this is slice 9 of
-[#24](https://github.com/wommy/turso/issues/24). An earlier version of this
-file described the refusal in the present tense, which a guard audit read as a
-claim about the code and correctly reported as false. An ADR that records a
-decision ahead of the work has to say so, or it becomes a document asserting
-behaviour nobody can find.
+Built in `da516ea`, in `http_response_for` (`cli/mcp/http.rs`) rather than in
+`read_http_request`. The header survives the read either way — that scan only
+looks for `\r\n\r\n` — so the refusal needs no socket and sits with every
+other refusal on that path.
+
+**`chunked` is matched as a token, not as the whole header value.** RFC 9112
+requires `chunked` to be the last coding when present, so `Transfer-Encoding:
+gzip, chunked` is the same case and is refused the same way. This ADR's prose
+said only "chunked"; the wider reading follows from "understands
+`Content-Length` and nothing else" and is recorded here so the next reader does
+not take the narrow wording as the decision.
+
+*This file spent a few hours marked "decided, not yet built", because an earlier
+version described the refusal in the present tense while no part of it existed
+and a guard audit correctly reported the ADR as false. Worth keeping in mind for
+the next ADR written ahead of its slice.*
 
 ## Why this needs recording
 

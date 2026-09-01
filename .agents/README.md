@@ -12,7 +12,14 @@ worktree rather than switching branches in place:
 git worktree add ../turso-agent-config claude/agent-config
 ```
 
-The other worktrees reach it through a `.agents-ref` symlink.
+The other worktrees reach it through a `.agents-ref` symlink. **Read through
+it, never write through it.** It points into this branch's checkout, so an edit
+made through `.agents-ref` lands in a different repository — one that another
+agent may be working in — and `git` in the consuming worktree cannot see it at
+all, reporting only "beyond a symbolic link". An implementer agent was told to
+update an ADR as part of its commit, did so through the symlink, and had to go
+and revert it in the other checkout. Changes to anything under `.agents/` are
+made here, on this branch.
 
 ## Reach for these
 
