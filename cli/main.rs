@@ -6,7 +6,7 @@ mod dot_command;
 mod helper;
 mod input;
 mod manual;
-mod mcp_server;
+mod mcp;
 mod opcodes_dictionary;
 mod read_state_machine;
 mod sync_server;
@@ -15,7 +15,7 @@ mod sync_server;
 mod mvcc_repl;
 
 use config::CONFIG_DIR;
-use mcp_server::TursoMcpServer;
+use mcp::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
@@ -43,7 +43,7 @@ pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".li
 fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     let conn = app.get_connection();
     let interrupt_count = app.get_interrupt_count();
-    let mcp_server = TursoMcpServer::new(conn, interrupt_count);
+    let mcp_server = TursoMcpServer::new(conn, interrupt_count, app.is_readonly());
 
     mcp_server.run()
 }

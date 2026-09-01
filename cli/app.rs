@@ -453,6 +453,12 @@ impl Limbo {
         self.opts.sync_server_address.is_some()
     }
 
+    /// The MCP server needs this as well as the connection: it advertises which
+    /// tools exist, and it can be asked to open a different database.
+    pub fn is_readonly(&self) -> bool {
+        self.opts.readonly
+    }
+
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
         self.interrupt_count.clone()
     }
