@@ -31,9 +31,17 @@ is the failure ADR 0006 is about, arriving by a different road.
 
 ## Steps
 
-1. Read the check runs for every open PR: `pull_request_read` with
-   `get_check_runs`. **Not `get_status`** — it returns an empty legacy list here
+1. Ask whether anything is red, repository-wide, in one call:
+   `actions_list` / `list_workflow_runs` with
+   `workflow_runs_filter: {"status": "failure"}`, then again with
+   `"timed_out"`. Each returns a `total_count`, and zero is the whole answer -
+   no per-PR loop, no paging. Reach for `pull_request_read` with
+   `get_check_runs` only once something is red and you need to know which PR
+   and which job. **Never `get_status`** — it returns an empty legacy list here
    and reads as "no CI".
+
+   Listing runs unfiltered instead costs a 140-220 KB result that has to be
+   parsed to find the same zero.
 2. Classify each PR: **red**, **green**, **queued**, **conflicted**.
 3. `queued` is not a failure, and on this fork most of it is not temporary
    either — see **CI cannot go green here** below. Act only on `failure` or
