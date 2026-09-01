@@ -87,11 +87,16 @@ impl TursoMcpServer {
 
         let request_data = read_http_request(&mut stream)?;
         let (method, path, headers, body) = parse_http_request(&request_data)?;
+        let req = HttpRequest { headers, body };
 
-        let response = match route_request(&method, &path) {
-            Route::Handle => http_response_for(self, &HttpRequest { headers, body }),
-            Route::MethodNotAllowed => plain_text_response(405, b"Method Not Allowed"),
-            Route::NotFound => plain_text_response(404, b"Not Found"),
+        let response = if let Some(rejection) = check_origin(&req) {
+            rejection
+        } else {
+            match route_request(&method, &path) {
+                Route::Handle => http_response_for(self, &req),
+                Route::MethodNotAllowed => plain_text_response(405, b"Method Not Allowed"),
+                Route::NotFound => plain_text_response(404, b"Not Found"),
+            }
         };
 
         stream.write_all(&format_http_response(&response))?;
@@ -134,10 +139,8 @@ fn plain_text_response(status: u16, body: &'static [u8]) -> HttpResponse {
 }
 
 pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResponse {
-    if let Some(origin) = req.header("Origin") {
-        if !origin_is_loopback(origin) {
-            return forbidden_origin(origin);
-        }
+    if let Some(rejection) = check_origin(req) {
+        return rejection;
     }
     if has_chunked_transfer_encoding(req) {
         return length_required();
@@ -222,11 +225,26 @@ fn http_status_for(body: &str) -> u16 {
     }
 }
 
-/// The MCP spec's DNS-rebinding defense: a browser-sent `Origin` that is
-/// present and not loopback is refused before the request is routed at all.
-/// A non-browser client sends no `Origin`, so its absence is allowed - the
-/// spec's own wording is "if present and invalid".
+/// The MCP spec's DNS-rebinding defense (MUST, `streamable-http.mdx` L57-63):
+/// validated "on all incoming connections", so `handle_http_connection` calls
+/// this before `route_request` decides anything - a `GET`/`DELETE` the router
+/// would otherwise answer with `405`/`404` must still get `403` first when its
+/// `Origin` is invalid. `http_response_for` also calls it, first thing, so
+/// the tests below that reach it directly see the same behavior without
+/// going through a live listener.
 ///
+/// A browser-sent `Origin` that is present and not loopback is refused. A
+/// non-browser client sends no `Origin`, so its absence is allowed - the
+/// spec's own wording is "if present and invalid".
+fn check_origin(req: &HttpRequest) -> Option<HttpResponse> {
+    let origin = req.header("Origin")?;
+    if origin_is_loopback(origin) {
+        None
+    } else {
+        Some(forbidden_origin(origin))
+    }
+}
+
 /// Loopback here is `localhost`, the whole `127.0.0.0/8` block (loopback to
 /// the kernel, not just `127.0.0.1`), and IPv6 `::1`, on any port and any
 /// scheme. The host is parsed out of the authority rather than
@@ -308,8 +326,9 @@ fn length_required() -> HttpResponse {
 }
 
 /// Whether `validate_headers` applies to this request at all. Its headers -
-/// `Mcp-Method`, `Mcp-Name` - are `2026-07-28` inventions (MUST,
-/// `streamable-http.mdx` L253-297), and a dual-era server picks its behavior
+/// `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` - are `2026-07-28`
+/// inventions (MUST, `streamable-http.mdx` L250-297), and a dual-era server
+/// picks its behavior
 /// from how the client opens (MUST, `basic/versioning.mdx` L175-180): a
 /// request carrying modern per-request `_meta` is served under this
 /// revision, everything else - including an `initialize` handshake - under
@@ -346,6 +365,8 @@ fn requires_header_validation(request: &JsonRpcRequest) -> bool {
 fn validate_headers(req: &HttpRequest, request: &JsonRpcRequest) -> Result<(), HttpResponse> {
     let id = request.id.clone();
     let body_method = request.method.as_str();
+
+    validate_protocol_version_header(req, request, id.clone())?;
 
     let header_method = checked_header(req, "Mcp-Method", id.clone())?
         .ok_or_else(|| header_mismatch(id.clone(), "Missing required header: Mcp-Method"))?;
@@ -396,6 +417,45 @@ fn validate_headers(req: &HttpRequest, request: &JsonRpcRequest) -> Result<(), H
     Ok(())
 }
 
+/// The spec's MUSTs at `streamable-http.mdx` L250-252 and L257-261: every
+/// POST carrying the modern per-request `_meta` must include an
+/// `MCP-Protocol-Version` header, and its value must match `_meta`'s
+/// `io.modelcontextprotocol/protocolVersion` field exactly. Unlike
+/// `Mcp-Method`/`Mcp-Name`, which only duplicate a value already in the body,
+/// this is the one of the three that carries real information - a mismatch is
+/// how a proxy or a confused client reveals itself.
+///
+/// Scoped to the modern branch by `validate_headers`'s own caller
+/// (`requires_header_validation`), exactly the way `Mcp-Method`/`Mcp-Name`
+/// are: a legacy client speaks a revision that defines no such header and has
+/// no way to send it, so demanding it unconditionally would repeat the #44
+/// regression this file already fixed once. Because that gate only lets a
+/// request through when `declares_v2()` is true, `request.protocol_version()`
+/// here is always `Some(PROTOCOL_V2)` - the header is checked against
+/// whatever that call actually returns rather than the constant directly, so
+/// this keeps working unchanged if a later revision widens what counts as
+/// modern.
+fn validate_protocol_version_header(
+    req: &HttpRequest,
+    request: &JsonRpcRequest,
+    id: Option<Value>,
+) -> Result<(), HttpResponse> {
+    let header_version =
+        checked_header(req, "MCP-Protocol-Version", id.clone())?.ok_or_else(|| {
+            header_mismatch(id.clone(), "Missing required header: MCP-Protocol-Version")
+        })?;
+    let body_version = request.protocol_version().unwrap_or_default();
+    if header_version != body_version {
+        return Err(header_mismatch(
+            id,
+            format!(
+                "Header mismatch: MCP-Protocol-Version header value '{header_version}' does not match body value '{body_version}'"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The methods where the spec's `Mcp-Name` header carries `params.name` (or
 /// `params.uri` for a resource) and must be validated against the body.
 const NAME_REQUIRED_METHODS: [&str; 3] = ["tools/call", "resources/read", "prompts/get"];
@@ -413,9 +473,9 @@ const NAME_REQUIRED_METHODS: [&str; 3] = ["tools/call", "resources/read", "promp
 ///
 /// Character validity (RFC 9110 5.5: visible ASCII, space, or tab) is
 /// checked here too, scoped to just the headers this function is asked
-/// about - `Mcp-Method` and `Mcp-Name` - rather than every header on the
-/// request. This server does not read the others, so it has no business
-/// rejecting `obs-text` bytes in them.
+/// about - `Mcp-Method`, `Mcp-Name`, and `MCP-Protocol-Version` - rather than
+/// every header on the request. This server does not read the others, so it
+/// has no business rejecting `obs-text` bytes in them.
 fn checked_header<'a>(
     req: &'a HttpRequest,
     name: &str,
@@ -685,6 +745,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), "list_tables".to_string()),
             ],
@@ -747,7 +808,10 @@ mod tests {
         .to_string();
 
         let req = HttpRequest {
-            headers: vec![("Mcp-Method".to_string(), "tools/list".to_string())],
+            headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+            ],
             body: request_body.into_bytes(),
         };
 
@@ -770,7 +834,7 @@ mod tests {
         .to_string();
 
         let req = HttpRequest {
-            headers: vec![],
+            headers: vec![("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string())],
             body: request_body.into_bytes(),
         };
 
@@ -793,7 +857,10 @@ mod tests {
         .to_string();
 
         let req = HttpRequest {
-            headers: vec![("Mcp-Method".to_string(), "tools/call".to_string())],
+            headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+            ],
             body: request_body.into_bytes(),
         };
 
@@ -817,6 +884,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), "foo".to_string()),
             ],
@@ -846,6 +914,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), "list_tables\u{0007}".to_string()),
             ],
@@ -877,6 +946,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Method".to_string(), "tools/list".to_string()),
                 ("Mcp-Name".to_string(), "list_tables".to_string()),
@@ -902,6 +972,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/list".to_string()),
                 ("Mcp-Method".to_string(), "tools/list".to_string()),
             ],
@@ -952,6 +1023,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/list".to_string()),
                 ("X-Trace".to_string(), "café".to_string()),
             ],
@@ -975,7 +1047,10 @@ mod tests {
         .to_string();
 
         let req = HttpRequest {
-            headers: vec![("Mcp-Method".to_string(), "tools/list\u{0007}".to_string())],
+            headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
+                ("Mcp-Method".to_string(), "tools/list\u{0007}".to_string()),
+            ],
             body: request_body.into_bytes(),
         };
 
@@ -1005,6 +1080,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), format!("=?base64?{encoded}?=")),
             ],
@@ -1038,6 +1114,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), format!("=?base64?{encoded}?=")),
             ],
@@ -1064,6 +1141,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), "list_tables".to_string()),
             ],
@@ -1093,6 +1171,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 (
                     "Mcp-Name".to_string(),
@@ -1129,6 +1208,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), format!("=?BASE64?{encoded}?=")),
             ],
@@ -1160,6 +1240,7 @@ mod tests {
 
         let req = HttpRequest {
             headers: vec![
+                ("MCP-Protocol-Version".to_string(), PROTOCOL_V2.to_string()),
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), literal_name.to_string()),
             ],
@@ -1520,5 +1601,110 @@ mod tests {
         };
         let response = http_response_for(&server, &missing);
         assert_eq!(response.status, 200, "{:?}", response.body);
+    }
+
+    /// The spec's MUST at `streamable-http.mdx` L257-261: a modern request
+    /// whose `MCP-Protocol-Version` header disagrees with `_meta`'s
+    /// `protocolVersion` is `400`/`HEADER_MISMATCH`. Every other test in this
+    /// file that reaches `validate_headers` at all sends a header matching
+    /// `v2_meta()`'s `PROTOCOL_V2` and is served (ADR 0005's "good direction
+    /// already covered incidentally" exception), so this is the one dedicated
+    /// bad-input case the guard needs.
+    #[test]
+    fn a_protocol_version_header_that_disagrees_with_body_meta_is_rejected() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": v2_meta() },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("MCP-Protocol-Version".to_string(), "2025-11-25".to_string()),
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], HEADER_MISMATCH);
+    }
+
+    /// The companion missing-header case, mirroring
+    /// `a_modern_request_missing_the_mcp_method_header_entirely_is_rejected`:
+    /// a modern request that omits `MCP-Protocol-Version` outright is
+    /// rejected the same way a disagreeing value is, not silently let
+    /// through for lack of anything to compare.
+    #[test]
+    fn a_modern_request_missing_the_protocol_version_header_entirely_is_rejected() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": v2_meta() },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "tools/list".to_string())],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], HEADER_MISMATCH);
+    }
+
+    /// The direction #47 calls the trap: adding the `MCP-Protocol-Version`
+    /// check must not repeat the #44 regression this file already fixed
+    /// once. A legacy `initialize`, carrying no `_meta` that declares
+    /// `2026-07-28`, sends no `MCP-Protocol-Version` header because the
+    /// revisions it speaks never defined one, and must still be served. This
+    /// is the same captured request as
+    /// `a_legacy_initialize_with_only_the_captured_headers_is_served`, kept
+    /// as its own test so it stays red on its own if this guard's scoping
+    /// ever regresses, independent of the `Mcp-Method`/`Mcp-Name` guards that
+    /// test also covers.
+    #[test]
+    fn a_legacy_initialize_missing_the_protocol_version_header_is_still_served() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "mcp", "version": "0.1.0" },
+                "_meta": {},
+            },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                (
+                    "accept".to_string(),
+                    "application/json, text/event-stream".to_string(),
+                ),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200, "{:?}", response.body);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert!(body["error"].is_null(), "{body}");
     }
 }

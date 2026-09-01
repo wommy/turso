@@ -219,6 +219,41 @@ fn origin_validation_matches_the_documented_loopback_policy() {
     }
 }
 
+/// `handle_http_connection` used to route the request before validating
+/// `Origin` at all, so `Origin` was only ever checked inside the `POST` arm -
+/// a cross-origin `GET`/`DELETE` fell through to the router's own
+/// `405`/`404` instead of the `403` the DNS-rebinding defense requires.
+/// A real listener is the only way to prove this: the unit tests in
+/// `cli/mcp/http.rs` call `http_response_for` directly, which only the
+/// `POST` route ever reaches.
+#[test]
+fn a_cross_origin_get_to_the_mcp_endpoint_is_forbidden_not_method_not_allowed() {
+    let (_child, port) = start_mcp_http_server();
+
+    let request = "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example.com\r\n\r\n";
+    let response = send_http_request(port, request);
+
+    assert_eq!(status_code(&response), "403", "response: {response}");
+}
+
+/// The accept direction for the guard above (ADR 0005): a `GET` to `/mcp`
+/// whose `Origin` is loopback - or has none at all - must still get the
+/// plain `405` `route_request` already answers with, not be swept up by the
+/// new `Origin` check firing early.
+#[test]
+fn a_loopback_get_to_the_mcp_endpoint_is_still_method_not_allowed() {
+    let (_child, port) = start_mcp_http_server();
+
+    let with_origin =
+        "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://localhost:3000\r\n\r\n";
+    let response = send_http_request(port, with_origin);
+    assert_eq!(status_code(&response), "405", "response: {response}");
+
+    let without_origin = "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    let response = send_http_request(port, without_origin);
+    assert_eq!(status_code(&response), "405", "response: {response}");
+}
+
 /// Proves `ChildGuard::drop` actually runs on a panic, rather than just
 /// renaming the old manual `kill`/`wait` calls. A closure that panics while
 /// holding the guard is the defect this file used to have: any `.expect()`
