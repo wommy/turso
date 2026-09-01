@@ -11,7 +11,7 @@ way the spec now prevents. Where a genuine question remains it is marked
 
 | Workflow | Trigger | Has a checkpoint? |
 |---|---|---|
-| [prior-capability-check](prior-capability-check.md) | event: a new capability is proposed | only when something is found |
+| [prior-capability-check](prior-capability-check.md) | armed by `periodic-sweeps` on a count | only when something is found |
 | [pr-drive-to-green](pr-drive-to-green.md) | schedule: hourly while a PR is open | only on ambiguous failures |
 | [periodic-sweeps](periodic-sweeps.md) | count: every ~5 slices, or before offering upstream | only when a sweep changes the plan |
 

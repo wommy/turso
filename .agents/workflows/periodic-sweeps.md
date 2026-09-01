@@ -97,7 +97,13 @@ wc -l $(find .agents -name '*.md')          # the trend, against the last sweep'
   needs to say which commit it was true of, or it will be read as current long
   after it is not.
 - **A document no pointer reaches.** Every file earns a row in
-  [`../README.md`](../README.md) or it is riding on somebody's memory.
+  [`../README.md`](../README.md) or it is riding on somebody's memory. The
+  README indexes *directories* as well as files, so check reachability at that
+  level — a naive per-file check reports every ADR as an orphan.
+- **A dead link, anchors included.** Check the `#fragment` against the target's
+  actual headings, not just that the file exists. A checker that splits on `#`
+  and discards it reported "all links resolve" while one pointed at a section
+  deleted an hour earlier, in the same pass that deleted it.
 
 **End with a deletion, or say why there is none.** That clause is the whole
 point of this sweep. The failure mode is sediment — stale layers settling

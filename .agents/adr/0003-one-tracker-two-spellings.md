@@ -24,22 +24,13 @@ copies drift; splitting by operation keeps one list and varies only the spelling
 
 ## Consequences
 
-The two spellings are not perfectly equivalent, and the differences are recorded
-next to the table rather than discovered at runtime:
+The two spellings are not perfectly equivalent. Where they differ — labels being
+a whole-array update under MCP, repo scope being enforced rather than empty,
+operations with no MCP spelling at all — the difference is recorded beside the
+operation in [`../config/issue-tracker.md`](../config/issue-tracker.md), not
+here. That file is where someone stands when the difference bites.
 
-- **Labels are a whole-array update under MCP.** `issue_write` replaces the label
-  set rather than adding to it, so a caller must read the current labels and send
-  the union or silently drop somebody else's. `gh issue edit --add-label` has no
-  such trap.
-- **Repo scope is enforced under MCP.** A call outside the session's scope list
-  is denied, not empty — an important distinction when a query returning nothing
-  would otherwise read as "no results".
-- **Some operations have no MCP spelling at all.** Label creation is the one that
-  has already bitten us: there is no `create_label` tool, so the five triage
-  labels cannot be created from a remote session and need a machine with `gh`.
-  Native issue dependencies (`blocked_by`) are the same story, which is why
-  wayfinding blocking edges fall back to a `Blocked by: #n` line in the body.
-
-When an operation turns out to have only one spelling, record it in
-`issue-tracker.md` beside the others rather than leaving the gap to be found
-again.
+The rule that keeps this decision alive: when an operation turns out to have
+only one spelling, record it there beside the others rather than leaving the gap
+to be found again. Label creation and native `blocked_by` are the two found so
+far, both MCP-side.

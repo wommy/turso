@@ -13,10 +13,8 @@ Every place the MCP protocol layer or HTTP transport refuses input, checked
 against two questions: is there a test proving it refuses bad input, and a
 separate test proving it still accepts good input. `none` means neither
 adjacent tests nor a repo-wide grep for the guard's message or error code
-turned one up. Background for why both directions matter, with the two
-incidents that motivated this table: [`background-agents.md`, "Negative proof
-has to isolate the test"](background-agents.md#negative-proof-has-to-isolate-the-test).
-The decision this table backs is [ADR 0005](../adr/0005-both-directions-of-a-guard-need-a-test.md).
+turned one up. The decision this table backs, and the two
+incidents behind it, are [ADR 0005](../adr/0005-both-directions-of-a-guard-need-a-test.md).
 
 Snapshot taken 2026-09-01. `turso-http-mcp` was being committed to by another
 agent while this was read; treat the HTTP-transport half as a point-in-time
