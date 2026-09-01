@@ -195,7 +195,21 @@ fn sql_value_to_json(value: &DbValue) -> Value {
     match value {
         DbValue::Null => Value::Null,
         DbValue::Numeric(Numeric::Integer(n)) => json!(n),
-        DbValue::Numeric(Numeric::Float(f)) => json!(f64::from(*f)),
+        DbValue::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            if f.is_finite() {
+                json!(f)
+            } else {
+                // JSON has no numeral for +/-Infinity: serde_json would map
+                // either to `null`, indistinguishable from a genuine SQL
+                // NULL. Tagged the same way a blob is tagged, so a model
+                // can't mistake it for NULL or a plain number. (NaN is not
+                // handled here: Numeric::Float wraps NonNan, which rejects
+                // NaN at construction, so it can never reach this arm - see
+                // numeric::nonnan::NonNan.)
+                json!({ "float": if f.is_sign_negative() { "-Infinity" } else { "Infinity" } })
+            }
+        }
         DbValue::Text(text) => {
             let text = text.to_string();
             if text.len() <= MAX_CELL_BYTES {
@@ -349,7 +363,7 @@ impl TursoMcpServer {
                             "idempotentHint": true,
                             "openWorldHint": false
                         },
-                        "outputSchema": { "type": "object", "properties": { "truncated": { "type": "boolean" }, "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
+                        "outputSchema": { "type": "object", "properties": { "truncated": { "type": "boolean" }, "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string. A non-finite float (Infinity or -Infinity; NaN cannot occur) is an object with a `float` key holding that name as a string, never a bare number, since JSON has no numeral for either." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
                         "description": "Execute a read-only SELECT query",
                         "inputSchema": {
                             "type": "object",
@@ -894,7 +908,7 @@ mod tests {
         TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), false)
     }
 
-    fn query_arg(sql: &str) -> Option<Value> {
+    fn query_params(sql: &str) -> Option<Value> {
         Some(json!({ "query": sql }))
     }
 
@@ -914,7 +928,7 @@ mod tests {
 
     fn orders_dump(server: &TursoMcpServer) -> String {
         server
-            .execute_query(&query_arg(
+            .execute_query(&query_params(
                 "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
             ))
             .expect("dumping the table succeeds")
@@ -926,7 +940,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.update_data(&query_arg(
+        let result = server.update_data(&query_params(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         ));
 
@@ -952,7 +966,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.update_data(&query_arg(
+        let result = server.update_data(&query_params(
             "UPDATE bench_orders SET status='DONE; DELETE' WHERE order_id=1",
         ));
         let text = result.expect("a single UPDATE succeeds").text;
@@ -968,7 +982,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.insert_data(&query_arg(
+        let result = server.insert_data(&query_params(
             "INSERT INTO bench_orders VALUES (3, 'NEW', 3); DELETE FROM bench_orders WHERE order_id=2",
         ));
 
@@ -986,7 +1000,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.delete_data(&query_arg(
+        let result = server.delete_data(&query_params(
             "DELETE FROM bench_orders WHERE order_id=1; DROP TABLE bench_orders",
         ));
 
@@ -1005,7 +1019,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.schema_change(&query_arg(
+        let result = server.schema_change(&query_params(
             "CREATE TABLE extra (id INTEGER); DELETE FROM bench_orders",
         ));
 
@@ -1023,7 +1037,7 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.execute_query(&query_arg(
+        let result = server.execute_query(&query_params(
             "SELECT order_id FROM bench_orders WHERE order_id=1; DELETE FROM bench_orders WHERE order_id=2",
         ));
 
@@ -1040,13 +1054,64 @@ mod tests {
         let server = memory_server();
         seed_bench_orders(&server);
 
-        let result = server.update_data(&query_arg(
+        let result = server.update_data(&query_params(
             "UPDATE bench_orders SET status='DONE' WHERE order_id=1",
         ));
         let text = result.expect("a single UPDATE succeeds").text;
         assert!(text.starts_with("UPDATE successful."), "{text}");
         assert!(orders_dump(&server).contains("1 | DONE | 1"));
         assert!(orders_dump(&server).contains("2 | HOLD | 2"));
+    }
+
+    /// The other direction of the class check above: every write tool must
+    /// refuse a well-formed, single statement of the wrong class, not just
+    /// a trailing extra one. Without this, `insert_data` given a bare DELETE
+    /// would run it - the class check would have quietly stopped working and
+    /// nothing here would notice.
+    #[test]
+    fn each_write_tool_refuses_a_statement_of_the_wrong_class() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        for (tool, result, expected) in [
+            (
+                "insert_data",
+                server.insert_data(&query_params("DELETE FROM bench_orders WHERE order_id=1")),
+                "Only INSERT statements are allowed",
+            ),
+            (
+                "update_data",
+                server.update_data(&query_params(
+                    "INSERT INTO bench_orders VALUES (3, 'NEW', 3)",
+                )),
+                "Only UPDATE statements are allowed",
+            ),
+            (
+                "delete_data",
+                server.delete_data(&query_params(
+                    "UPDATE bench_orders SET status='X' WHERE order_id=1",
+                )),
+                "Only DELETE statements are allowed",
+            ),
+            (
+                "schema_change",
+                server.schema_change(&query_params("DELETE FROM bench_orders WHERE order_id=1")),
+                "Only CREATE, ALTER, and DROP statements are allowed",
+            ),
+        ] {
+            let error = result.expect_err(&format!("{tool} must refuse a mismatched statement"));
+            assert!(error.contains(expected), "{tool}: {error}");
+        }
+
+        let dump = orders_dump(&server);
+        assert!(
+            dump.contains("1 | READY | 1"),
+            "nothing should have run: {dump}"
+        );
+        assert!(
+            dump.contains("2 | HOLD | 2"),
+            "nothing should have run: {dump}"
+        );
     }
 
     /// `changes()` is one counter on the shared connection, overwritten by
@@ -1066,10 +1131,10 @@ mod tests {
     fn concurrent_tool_calls_see_their_own_changes_not_each_others() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE race_a (v INTEGER)"))
+            .schema_change(&query_params("CREATE TABLE race_a (v INTEGER)"))
             .expect("create race_a");
         server
-            .schema_change(&query_arg("CREATE TABLE race_b (v INTEGER)"))
+            .schema_change(&query_params("CREATE TABLE race_b (v INTEGER)"))
             .expect("create race_b");
 
         const ITERATIONS: usize = 500;
@@ -1078,7 +1143,7 @@ mod tests {
             let one_row_thread = scope.spawn(|| {
                 for _ in 0..ITERATIONS {
                     let result = server
-                        .insert_data(&query_arg("INSERT INTO race_a VALUES (1)"))
+                        .insert_data(&query_params("INSERT INTO race_a VALUES (1)"))
                         .expect("insert into race_a succeeds");
                     assert_eq!(
                         result.structured["changes"], 1,
@@ -1089,7 +1154,7 @@ mod tests {
             let two_row_thread = scope.spawn(|| {
                 for _ in 0..ITERATIONS {
                     let result = server
-                        .insert_data(&query_arg("INSERT INTO race_b VALUES (1), (2)"))
+                        .insert_data(&query_params("INSERT INTO race_b VALUES (1), (2)"))
                         .expect("insert into race_b succeeds");
                     assert_eq!(
                         result.structured["changes"], 2,
@@ -1165,6 +1230,52 @@ mod tests {
         );
     }
 
+    /// `describe_table` had no test in either direction: a guard that refused
+    /// every call would have passed the suite just as well as this one. This
+    /// covers both refusals, and `describe_table_accepts_a_table_that_exists`
+    /// below covers the accepting side that would otherwise be missing.
+    #[test]
+    fn describe_table_rejects_a_missing_table_name() {
+        let server = memory_server();
+
+        let error = server
+            .describe_table(&None)
+            .expect_err("a call with no table_name must be refused");
+        assert!(
+            error.contains("Missing or invalid table_name parameter"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn describe_table_rejects_a_table_that_does_not_exist() {
+        let server = memory_server();
+
+        let error = server
+            .describe_table(&Some(json!({ "table_name": "ghost" })))
+            .expect_err("an unknown table must be refused");
+        assert!(error.contains("Table 'ghost' not found"), "got: {error}");
+    }
+
+    #[test]
+    fn describe_table_accepts_a_table_that_exists() {
+        let server = memory_server();
+        seed_bench_orders(&server);
+
+        let result = server
+            .describe_table(&Some(json!({ "table_name": "bench_orders" })))
+            .expect("an existing table must be described");
+        assert!(result.text.contains("order_id"), "{}", result.text);
+        assert_eq!(result.structured["table"], "bench_orders");
+        let columns = result.structured["columns"].as_array().unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|c| c["name"] == "order_id" && c["primary_key"] == true),
+            "{columns:?}"
+        );
+    }
+
     /// A client should be able to tell a read from a destructive write without
     /// calling either one.
     #[test]
@@ -1230,19 +1341,19 @@ mod tests {
         for (tool, result) in [
             (
                 "insert_data",
-                server.insert_data(&query_arg("INSERT INTO t VALUES (1)")),
+                server.insert_data(&query_params("INSERT INTO t VALUES (1)")),
             ),
             (
                 "update_data",
-                server.update_data(&query_arg("UPDATE t SET x=1")),
+                server.update_data(&query_params("UPDATE t SET x=1")),
             ),
             (
                 "delete_data",
-                server.delete_data(&query_arg("DELETE FROM t")),
+                server.delete_data(&query_params("DELETE FROM t")),
             ),
             (
                 "schema_change",
-                server.schema_change(&query_arg("CREATE TABLE t (x)")),
+                server.schema_change(&query_params("CREATE TABLE t (x)")),
             ),
         ] {
             let refused = result.expect_err("{tool} must be refused under --readonly");
@@ -1277,11 +1388,11 @@ mod tests {
     fn a_query_stops_at_the_row_cap_and_says_that_it_did() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE many (n INTEGER)"))
+            .schema_change(&query_params("CREATE TABLE many (n INTEGER)"))
             .expect("create");
         for n in 0..5 {
             server
-                .insert_data(&query_arg(&format!("INSERT INTO many VALUES ({n})")))
+                .insert_data(&query_params(&format!("INSERT INTO many VALUES ({n})")))
                 .expect("insert");
         }
 
@@ -1299,7 +1410,7 @@ mod tests {
         );
 
         let whole = server
-            .execute_query(&query_arg("SELECT n FROM many"))
+            .execute_query(&query_params("SELECT n FROM many"))
             .expect("query succeeds");
         assert_eq!(whole.structured["row_count"], 5);
         assert_eq!(
@@ -1314,15 +1425,15 @@ mod tests {
     fn an_oversized_cell_is_shaped_so_it_cannot_pass_for_the_whole_value() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE big (t TEXT)"))
+            .schema_change(&query_params("CREATE TABLE big (t TEXT)"))
             .expect("create");
         let long = "x".repeat(MAX_CELL_BYTES * 2);
         server
-            .insert_data(&query_arg(&format!("INSERT INTO big VALUES ('{long}')")))
+            .insert_data(&query_params(&format!("INSERT INTO big VALUES ('{long}')")))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT t FROM big"))
+            .execute_query(&query_params("SELECT t FROM big"))
             .expect("query succeeds");
         let cell = &result.structured["rows"][0][0];
 
@@ -1364,17 +1475,19 @@ mod tests {
     fn a_multibyte_cell_is_cut_to_the_byte_budget_not_the_character_count() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE wide (t TEXT)"))
+            .schema_change(&query_params("CREATE TABLE wide (t TEXT)"))
             .expect("create");
         // Three bytes per character, so a character-based cut would keep
         // roughly three times the budget.
         let long = "\u{4e16}".repeat(MAX_CELL_BYTES);
         server
-            .insert_data(&query_arg(&format!("INSERT INTO wide VALUES ('{long}')")))
+            .insert_data(&query_params(&format!(
+                "INSERT INTO wide VALUES ('{long}')"
+            )))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT t FROM wide"))
+            .execute_query(&query_params("SELECT t FROM wide"))
             .expect("query succeeds");
         let cell = &result.structured["rows"][0][0];
 
@@ -1436,15 +1549,15 @@ mod tests {
     fn an_oversized_cell_is_cut_in_the_text_field_too() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE big (t TEXT)"))
+            .schema_change(&query_params("CREATE TABLE big (t TEXT)"))
             .expect("create");
         let long = "y".repeat(MAX_CELL_BYTES * 4);
         server
-            .insert_data(&query_arg(&format!("INSERT INTO big VALUES ('{long}')")))
+            .insert_data(&query_params(&format!("INSERT INTO big VALUES ('{long}')")))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT t FROM big"))
+            .execute_query(&query_params("SELECT t FROM big"))
             .expect("query succeeds");
 
         assert!(
@@ -1461,14 +1574,14 @@ mod tests {
     fn null_and_an_empty_string_are_not_the_same_cell() {
         let server = memory_server();
         server
-            .schema_change(&query_arg("CREATE TABLE n (a TEXT)"))
+            .schema_change(&query_params("CREATE TABLE n (a TEXT)"))
             .expect("create");
         server
-            .insert_data(&query_arg("INSERT INTO n VALUES (NULL), ('')"))
+            .insert_data(&query_params("INSERT INTO n VALUES (NULL), ('')"))
             .expect("insert");
 
         let result = server
-            .execute_query(&query_arg("SELECT a FROM n"))
+            .execute_query(&query_params("SELECT a FROM n"))
             .expect("query succeeds");
 
         assert!(result.text.contains("NULL"), "{}", result.text);
@@ -1480,5 +1593,68 @@ mod tests {
             result.structured["rows"][1][0], "",
             "and keeps the empty string as a string"
         );
+    }
+
+    /// serde_json maps any non-finite f64 to `null`, so an untagged Infinity
+    /// would be indistinguishable from a genuine SQL NULL. Both directions
+    /// matter: this only checks that Infinity and -Infinity come back tagged
+    /// and distinguishable from each other and from null - a finite float and
+    /// a real NULL alongside them are covered separately below, so a fix that
+    /// tags every float can't sneak past this test alone.
+    #[test]
+    fn non_finite_floats_round_trip_distinguishably() {
+        let server = memory_server();
+        server
+            .schema_change(&query_params("CREATE TABLE nf (f REAL)"))
+            .expect("create");
+        server
+            .insert_data(&query_params(
+                "INSERT INTO nf VALUES (1e999), (-1e999), (NULL)",
+            ))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_params("SELECT f FROM nf"))
+            .expect("query succeeds");
+        let rows = &result.structured["rows"];
+
+        assert_eq!(
+            rows[0][0],
+            json!({ "float": "Infinity" }),
+            "Infinity must be tagged, not collapsed to null: {rows}"
+        );
+        assert_eq!(
+            rows[1][0],
+            json!({ "float": "-Infinity" }),
+            "-Infinity must be tagged and distinguishable from Infinity: {rows}"
+        );
+        assert!(
+            rows[2][0].is_null(),
+            "a genuine SQL NULL must still come back as null: {rows}"
+        );
+    }
+
+    /// The point of the guard above: it must not tag every float, only the
+    /// non-finite ones. An ordinary value has to survive as a plain number.
+    #[test]
+    fn an_ordinary_float_is_still_a_plain_json_number() {
+        let server = memory_server();
+        server
+            .schema_change(&query_params("CREATE TABLE f (v REAL)"))
+            .expect("create");
+        server
+            .insert_data(&query_params("INSERT INTO f VALUES (3.5)"))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_params("SELECT v FROM f"))
+            .expect("query succeeds");
+        let cell = &result.structured["rows"][0][0];
+
+        assert!(
+            cell.is_number(),
+            "a finite float must stay a bare JSON number, not an object: {cell}"
+        );
+        assert_eq!(cell.as_f64(), Some(3.5));
     }
 }
