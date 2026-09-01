@@ -32,9 +32,18 @@ a bonus that fires the loop early.
 4. For a red check, establish whether it is ours before fixing: does it name
    code the diff touches, and is it red on the base branch too?
 5. Fix, validate locally, push. One validated push beats three speculative ones.
-6. **Refresh this loop's own prompt** with the current PR heads, the current
-   issue state, and anything learned this run. This step is not optional; it is
-   the step whose absence caused the failure above.
+6. **Keep this loop's prompt free of state.** The first two versions carried
+   PR heads, test counts, disk figures and an issue list, and both rotted inside
+   an hour — the second one within an hour of being deliberately refreshed. The
+   remedy is not refreshing harder. It is what `implement-spec` says: communicate
+   through **context pointers**, never by duplicating what a pointer already
+   reaches. A prompt that names where state lives cannot go stale; a prompt that
+   copies state always will.
+
+   Only two kinds of thing belong in the prompt: pointers, and facts that do not
+   change (the `get_status`-returns-nothing trap, the pre-existing clippy failure
+   in a crate no branch here touches). If a line would be wrong an hour from now,
+   it is a pointer that has not been written yet.
 7. Re-arm.
 
 ## Checkpoint
