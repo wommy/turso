@@ -7,7 +7,15 @@ pub(crate) const PROTOCOL_V2: &str = "2026-07-28";
 
 /// Newest first. `2025-03-26` is left out deliberately - it is the
 /// batch-request revision, and we never implemented batching.
-pub(crate) const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_V2, "2025-06-18", "2024-11-05"];
+///
+/// `2025-11-25` changed nothing this server needed to catch up on: the
+/// features it added (icons, task-augmented execution, elicitation/sampling
+/// extensions, OAuth discovery) are all things we don't implement either
+/// side of, and the one behavioral change - input validation errors must be
+/// tool execution errors (`isError: true`), not protocol errors - is already
+/// how `tools/call` reports a bad argument here.
+pub(crate) const SUPPORTED_VERSIONS: [&str; 4] =
+    [PROTOCOL_V2, "2025-11-25", "2025-06-18", "2024-11-05"];
 
 /// Answer to a handshake asking for a version we do not know.
 pub(crate) const LEGACY_DEFAULT: &str = "2025-06-18";
