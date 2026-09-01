@@ -47,13 +47,39 @@ which is only #22 and #23.
   connected. Everything is verified against the spec text and against tests
   written from the same reading of it.
 
+## Upstream tracker check: done for all seven
+
+`gh-mcp` reads `tursodatabase/turso`'s issues without an attachment. Not gated on
+#22. Results, so nobody repeats the search:
+
+| Ours | Upstream | Verdict |
+|---|---|---|
+| [#20](https://github.com/wommy/turso/issues/20) classifySql | [#1440](https://github.com/tursodatabase/turso/issues/1440) open, `enhancement` | **May be invalidated.** If only the first statement executes at all, "writes skip the remote" is the wrong description. Needs a code check before filing. |
+| [#25](https://github.com/wommy/turso/issues/25) stale `.mdx` prompt | nothing | Unreported. File freely. |
+| [#26](https://github.com/wommy/turso/issues/26) tempfile leak | [#6143](https://github.com/tursodatabase/turso/issues/6143) closed | **Precedent.** They already accept `/tmp` leaks as a bug and fixed one. Reframe as same-class-different-mechanism. Read its fix first — the patch may be applying a convention they already added. |
+| [#30](https://github.com/wommy/turso/issues/30) `alter.rs` | **75 matches, 6 open, same shape** | **Transformative.** A standing open bug family of exactly the class we diagnosed. Lead with the family, not the refactor. See the ticket comment. |
+| [#30](https://github.com/wommy/turso/issues/30) btree | 27 matches, none ours | Unreported. Novel, but now the weaker half of that ticket. |
+| [#33](https://github.com/wommy/turso/issues/33) `CLAUDE.md` | nothing | Unreported. |
+| [#34](https://github.com/wommy/turso/issues/34) `.sqltest` | [#6312](https://github.com/tursodatabase/turso/issues/6312) open | Precedent — they already have an open ticket converting a test to `.sqltest`. The direction is sanctioned. |
+| [#36](https://github.com/wommy/turso/issues/36) dev profile | nothing | Unreported. |
+
+Two of eight changed how a report should be written and one may kill a report
+outright. Neither was expensive to find.
+
+**Note on the zeroes:** `CLAUDE.md` and build-profile issues return nothing at
+all, which may mean upstream does not track that kind of thing as issues. Those
+two may be better sent as pull requests directly than as reports.
+
 ## What is in flight and unfinished
 
-Checking upstream's tracker before filing the queued reports. Two searches, two
-hits, both recorded as comments: [#20](https://github.com/wommy/turso/issues/20)
-may be invalidated by upstream #1440, and [#26](https://github.com/wommy/turso/issues/26)
-has precedent in upstream #6143. **#25, #30, #33, #34 and #36 have not been
-checked.** Do that before any of them is filed.
+- **Split [#30](https://github.com/wommy/turso/issues/30)** — its two halves now
+  have very different evidence and should be separate reports.
+- **Resolve [#20](https://github.com/wommy/turso/issues/20)'s question against the
+  code** in the full upstream clone before filing it.
+- **Five slices left** on [#24](https://github.com/wommy/turso/issues/24): the
+  Base64 sentinel, malformed `_meta`, undeclared capability, chunked/411,
+  session-id ignoring. Plus thread-per-connection ([#32](https://github.com/wommy/turso/issues/32))
+  and five open defects on [#28](https://github.com/wommy/turso/issues/28).
 
 ## Things this session learned the hard way
 
