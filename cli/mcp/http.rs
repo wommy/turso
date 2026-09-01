@@ -4,7 +4,9 @@ use super::protocol::{
 use super::TursoMcpServer;
 use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
 use anyhow::Result;
+use base64::Engine;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -274,7 +276,15 @@ fn validate_headers(req: &HttpRequest) -> Result<(), HttpResponse> {
             .unwrap_or("");
         let header_name = checked_header(req, "Mcp-Name", id.clone())?
             .ok_or_else(|| header_mismatch(id.clone(), "Missing required header: Mcp-Name"))?;
-        if header_name != body_name {
+        let decoded_header_name = decode_base64_sentinel(header_name).ok_or_else(|| {
+            header_mismatch(
+                id.clone(),
+                format!(
+                    "Header mismatch: Mcp-Name header value '{header_name}' is not valid Base64"
+                ),
+            )
+        })?;
+        if decoded_header_name != body_name {
             return Err(header_mismatch(
                 id,
                 format!(
@@ -332,6 +342,41 @@ fn checked_header<'a>(
         found = Some(value.as_str());
     }
     Ok(found)
+}
+
+/// The spec's Base64 sentinel for `Mcp-Name` (MUST, L490-508): a value
+/// outside the header-safe ASCII set is carried as `=?base64?{value}?=`, and
+/// the server MUST decode it before comparing to the body (MUST, L501-504).
+///
+/// Returns the decoded value on a match, the value unchanged when it is not
+/// the sentinel shape, and `None` when the markers are present but the
+/// payload between them is not valid Base64 - a value the caller cannot
+/// compare to anything, so `validate_headers` turns it into the same
+/// `HeaderMismatch` any other non-matching value gets.
+///
+/// The markers "MUST appear exactly as shown (lowercase)" (L498-500), so
+/// this checks for the lowercase prefix and suffix only: `=?BASE64?...?=`
+/// does not match and falls through to the unchanged branch, comparing as a
+/// literal string rather than being decoded.
+///
+/// The alphabet and padding aren't pinned by name in the spec text - "Base64
+/// encoding of the UTF-8 representation" is the only description given. This
+/// uses RFC 4648's standard, padded alphabet, what "Base64" means absent a
+/// qualifier; the encoding examples in the spec (L515-518) are consistent
+/// with it (e.g. `SGVsbG8sIOS4lueVjA==` keeps its `==` padding).
+fn decode_base64_sentinel(value: &str) -> Option<Cow<'_, str>> {
+    const PREFIX: &str = "=?base64?";
+    const SUFFIX: &str = "?=";
+    let Some(payload) = value
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
+    else {
+        return Some(Cow::Borrowed(value));
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    String::from_utf8(decoded).ok().map(Cow::Owned)
 }
 
 /// RFC 9110 5.5: a header field value is visible ASCII (0x21-0x7E), space
@@ -703,6 +748,184 @@ mod tests {
         assert_eq!(response.status, 400);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
         assert_eq!(body["error"]["code"], -32020);
+    }
+
+    /// The spec's Base64 sentinel for `Mcp-Name` (MUST, L490-508): a name
+    /// outside the header-safe ASCII set is carried as
+    /// `=?base64?{Base64EncodedValue}?=` and the server MUST decode it
+    /// before comparing to `params.name` (MUST, L501-504).
+    #[test]
+    fn a_base64_encoded_mcp_name_matching_the_body_is_accepted() {
+        use base64::Engine;
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "café", "arguments": {} },
+        })
+        .to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("café");
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Name".to_string(), format!("=?base64?{encoded}?=")),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn a_base64_encoded_mcp_name_disagreeing_with_the_body_is_rejected() {
+        use base64::Engine;
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "something_else", "arguments": {} },
+        })
+        .to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("café");
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Name".to_string(), format!("=?base64?{encoded}?=")),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32020);
+    }
+
+    #[test]
+    fn a_plain_unencoded_mcp_name_matching_the_body_is_still_accepted() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_tables", "arguments": {} },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Name".to_string(), "list_tables".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200);
+    }
+
+    /// The markers are present but the payload between them is not valid
+    /// Base64 - a value that cannot be decoded cannot be compared to
+    /// anything, so it is treated the same as any other value that fails to
+    /// match the body (the spec's failure list, L625-630, does not name this
+    /// case separately).
+    #[test]
+    fn a_base64_marked_mcp_name_with_an_undecodable_payload_is_rejected() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "café", "arguments": {} },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                (
+                    "Mcp-Name".to_string(),
+                    "=?base64?not-valid-base64!!?=".to_string(),
+                ),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32020);
+    }
+
+    /// The spec's markers "MUST appear exactly as shown (lowercase)"
+    /// (L498-500). `=?BASE64?...?=` does not match that, so it is a literal
+    /// header value, not a sentinel to decode - proven here by pairing it
+    /// with a body value the *decoded* payload would equal, which must still
+    /// fail to match since no decoding happens.
+    #[test]
+    fn an_uppercase_base64_marker_is_treated_as_a_literal_value_not_decoded() {
+        use base64::Engine;
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "café", "arguments": {} },
+        })
+        .to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("café");
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Name".to_string(), format!("=?BASE64?{encoded}?=")),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32020);
+    }
+
+    /// A name that merely contains the sentinel pattern in the middle -
+    /// rather than starting with the prefix and ending with the suffix - is
+    /// a literal value. Pairing it with an identical body value proves it
+    /// round-trips unchanged rather than being mistaken for an encoded one.
+    #[test]
+    fn a_name_that_only_contains_the_sentinel_pattern_mid_string_is_treated_as_literal() {
+        let server = memory_server();
+        let literal_name = "foo=?base64?Zm9v?=bar";
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": literal_name, "arguments": {} },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Name".to_string(), literal_name.to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200);
     }
 
     /// The end-to-end 403 cases live in tests/mcp_http_transport.rs, which
