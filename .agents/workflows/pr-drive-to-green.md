@@ -24,11 +24,27 @@ backstop and events are a bonus that fires it early.
    and reads as "no CI".
 2. Classify each PR: **red**, **green**, **queued**, **conflicted**.
 3. `queued` is not a failure. Runners back up for hours and ninety-plus queued
-   checks is normal. Act only on `failure`, `timed_out` or `cancelled`.
-4. For a red check, establish it is ours before fixing: does it name code the
+   checks is normal. Act only on `failure` or `timed_out`. A `cancelled` run is
+   worth one glance at its head SHA: cancelled on a SHA the branch has moved
+   past is the concurrency group doing its job, and only a cancellation on the
+   current head is a real signal.
+4. **Check each stacked branch contains its base's head.** A PR stacked on
+   another branch does not follow that branch when it moves, so its diff and
+   its CI can both be green while missing the fix that just landed underneath
+   it. Compare with `git merge-base --is-ancestor <base head> <stacked head>`,
+   and merge forward when it comes back false.
+5. For a red check, establish it is ours before fixing: does it name code the
    diff touches, and is it red on the base branch too?
-5. Fix, validate locally, push. One validated push beats three speculative ones.
-6. Re-arm.
+6. Fix, validate locally, push. One validated push beats three speculative ones.
+7. Re-arm.
+
+Step 4 exists because the stack has silently fallen behind twice. The first
+time, a layer C fix was merged forward by two later merges that both predated
+it, so the branch that needed it never got it — caught only by a precondition
+check written into an unrelated agent brief. The second time, layer C gained a
+commit and the transport branch stacked over it did not, and every check on
+both was green throughout. Nothing about a green PR tells you its base has
+moved, which is exactly why this is a step rather than something to notice.
 
 **The scheduled prompt carries pointers and nothing else.** Two versions of it
 copied PR heads, test counts and issue lists, and both rotted within the hour —
