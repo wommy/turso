@@ -51,6 +51,25 @@ have made them worse.
 The tell: if you can write the list of commands before the agent starts, use the
 schema. If you cannot, do not.
 
+**Implementation is a third thing, and the two categories above do not cover
+it.** "Write this commit, red test first" has a known command list (`fmt`,
+`test`, `clippy`) and an output whose shape nobody knows until the code exists.
+It is the kind dispatched most often and the kind with no schema.
+
+Brief it in prose, and borrow one habit from each side: name the commands
+verbatim as verification does, and demand the reasoning as investigation does -
+how each test failed before it passed, what was left out on purpose, and what in
+the brief turned out to be wrong. That last question has caught a false claim in
+a brief twice.
+
+Two rules learned the expensive way, from runs of six to eleven minutes each:
+
+- **Pre-load, do not describe.** Two implementation agents burned 68 tool calls
+  apiece, most of it rediscovering code the brief could have pasted. Paste the
+  function under change into the brief.
+- **One agent per file, not per behaviour.** Two commits touching two files are
+  two agents running at once, not one agent doing both in sequence.
+
 Investigation briefs still borrow the discipline, just not the shape — say what
 counts as a finding, forbid the foreseeable workarounds, demand honesty about
 confidence, and list what has already been settled so it is not re-litigated.
