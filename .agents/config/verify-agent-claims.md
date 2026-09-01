@@ -20,6 +20,27 @@ report arrives carrying claims that will be acted on. Skip it for a report that
 is purely a recommendation with no factual claim, and for one whose claims a
 build is about to test anyway: the compiler is a cheaper verifier than reading.
 
+## A true report is not a correct commit
+
+This page checks what a report says. It cannot check what the commit does, and
+the two come apart in the direction that looks safest.
+
+An agent reported that it had run the build, clippy, `fmt --check` and the full
+suite, and that all four passed. Every word of that was true, and reproducing
+it confirmed all four. The commit still contained a loop that ran on the accept
+loop and only stopped on a short read, so a client that kept sending full
+buffers held up every other connection — reintroducing, inside the fix, the
+exact stall the fix existed to remove. It was found by reading the diff.
+
+So the two are separate obligations, and the second one is the one with no
+prompt: nothing arrives to trigger it, because a passing report reads like
+completion. **Read the diff of an agent's commit before pushing it**, however
+clean the report. The tests it ran are the tests it thought to write.
+
+The clause above about skipping a report whose claims a build will test is the
+trap here, so read it narrowly: the build settles whether the claims are true,
+never whether the change is right.
+
 ## How
 
 1. **Read the report's fields, not its closing summary.** A summary can smooth

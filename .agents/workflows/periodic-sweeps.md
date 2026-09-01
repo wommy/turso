@@ -18,9 +18,27 @@ What that missed, all found by accident:
   came from the same reading of the spec. Found the first time a third-party
   client spoke to the server
   ([#43](https://github.com/wommy/turso/issues/43), [#44](https://github.com/wommy/turso/issues/44)).
+- **A fix that had already been made and then undone.** Every tool dropped the
+  connection lock before running its query, at seven sites, after an earlier
+  commit had fixed exactly that. Found by diffing against the branch being
+  retired ([#49](https://github.com/wommy/turso/issues/49)).
+- **A fix that introduced the bug it was fixing.** The connection cap answers
+  a refused socket on the accept loop, and drained it with a loop that only
+  stopped on a short read — so a client that keeps sending holds up everyone,
+  which is the stall thread-per-connection was added to remove. Found by
+  reading a finished, green, clippy-clean commit whose own author had
+  validated it and whose report was entirely accurate.
 
-Neither is the kind of thing a per-slice review finds. Both need a pass whose
-unit is the whole change, not the commit.
+None of these is the kind of thing a per-slice review finds. The first three
+need a pass whose unit is the whole change rather than the commit.
+
+The fourth is different and worth separating out, because it is the one this
+loop does **not** cover: nothing was missing from the composite and nothing
+was contradicted by a spec — one commit was simply wrong, and its own tests
+and its own author agreed it was fine. The counter-measure is not a sweep but
+a gate, and it lives in
+[`../config/verify-agent-claims.md`](../config/verify-agent-claims.md): read
+the diff of an agent's commit before pushing it.
 
 `prior-capability-check` was supposed to prevent the first and never fired
 once. Its trigger asked somebody to notice they were at a decision point, and
