@@ -561,7 +561,7 @@ fn header_mismatch(id: Option<Value>, message: impl Into<String>) -> HttpRespons
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::{LEGACY_DEFAULT, PROTOCOL_V2};
+    use super::super::protocol::PROTOCOL_V2;
     use super::*;
     use serde_json::{json, Value};
     use std::sync::atomic::AtomicUsize;
@@ -1530,12 +1530,13 @@ mod tests {
         assert_eq!(response.status, 200);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
         assert!(body["error"].is_null(), "{body}");
-        // `2025-11-25` is not in `SUPPORTED_VERSIONS` yet (#43, tracked
-        // separately), so `handle_initialize` answers with `LEGACY_DEFAULT`
-        // rather than echoing the asked-for version - this test is only
-        // about the request being served at all, not about which legacy
-        // version it is served as.
-        assert_eq!(body["result"]["protocolVersion"], LEGACY_DEFAULT);
+        // Echoed, not downgraded: #43 added `2025-11-25` to
+        // `SUPPORTED_VERSIONS`, so `handle_initialize` answers with the
+        // version the client asked for rather than falling back to
+        // `LEGACY_DEFAULT`. Asserting the exact string rather than "some
+        // legacy version" is deliberate - a downgrade here is exactly the
+        // bug #43 was, and it went unnoticed until a real client showed it.
+        assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
     }
 
     /// The trap #44 warns about, isolated from `initialize` so it is clear
