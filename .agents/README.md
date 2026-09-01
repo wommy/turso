@@ -26,6 +26,7 @@ The other worktrees reach it through a `.agents-ref` symlink.
 | **Building, linting, or out of disk** | [`config/build-workflow.md`](config/build-workflow.md) |
 | **Before exploring an unfamiliar crate** | [`config/domain.md`](config/domain.md) |
 | **Naming an MCP protocol revision** | [`CONTEXT.md`](CONTEXT.md) |
+| **Adding a guard, or a test for one, in the MCP work** | [`config/mcp-guard-audit.md`](config/mcp-guard-audit.md) |
 | **About to reopen a settled decision** | [`adr/`](adr/) |
 | **A scheduled loop needs arming or re-arming** | [`workflows/`](workflows/) |
 | **Writing something aimed at `tursodatabase/turso`** | [`upstream-drafts/`](upstream-drafts/) |
