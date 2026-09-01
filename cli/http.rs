@@ -132,7 +132,9 @@ pub fn parse_http_request(data: &[u8]) -> Result<ParsedHttpRequest> {
 pub fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
     let status_text = match resp.status {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
+        400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -167,6 +169,30 @@ pub fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Every status the MCP transport can answer with needs a reason phrase
+    /// here, and nothing else in the suite would notice a missing one: the
+    /// transport's own tests all go through `http_response_for`, which
+    /// returns a numeric status and never formats a response line. `400`
+    /// went out as `HTTP/1.1 400 Unknown` for three slices because of that.
+    #[test]
+    fn every_status_the_mcp_transport_sends_has_a_reason_phrase() {
+        for status in [200, 202, 400, 403, 404, 405] {
+            let response = HttpResponse {
+                status,
+                content_type: "application/json".to_string(),
+                body: Vec::new(),
+                extra_headers: Vec::new(),
+            };
+            let formatted = String::from_utf8(format_http_response(&response)).unwrap();
+            let line = formatted.lines().next().unwrap();
+
+            assert!(
+                !line.contains("Unknown"),
+                "status {status} has no reason phrase: {line}"
+            );
+        }
+    }
 
     /// A value that is not a number leaves the message length unknown. Parsing
     /// it away as "no body" is what makes that dangerous: the body then stays
