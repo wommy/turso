@@ -195,7 +195,21 @@ fn sql_value_to_json(value: &DbValue) -> Value {
     match value {
         DbValue::Null => Value::Null,
         DbValue::Numeric(Numeric::Integer(n)) => json!(n),
-        DbValue::Numeric(Numeric::Float(f)) => json!(f64::from(*f)),
+        DbValue::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            if f.is_finite() {
+                json!(f)
+            } else {
+                // JSON has no numeral for +/-Infinity: serde_json would map
+                // either to `null`, indistinguishable from a genuine SQL
+                // NULL. Tagged the same way a blob is tagged, so a model
+                // can't mistake it for NULL or a plain number. (NaN is not
+                // handled here: Numeric::Float wraps NonNan, which rejects
+                // NaN at construction, so it can never reach this arm - see
+                // numeric::nonnan::NonNan.)
+                json!({ "float": if f.is_sign_negative() { "-Infinity" } else { "Infinity" } })
+            }
+        }
         DbValue::Text(text) => {
             let text = text.to_string();
             if text.len() <= MAX_CELL_BYTES {
@@ -349,7 +363,7 @@ impl TursoMcpServer {
                             "idempotentHint": true,
                             "openWorldHint": false
                         },
-                        "outputSchema": { "type": "object", "properties": { "truncated": { "type": "boolean" }, "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
+                        "outputSchema": { "type": "object", "properties": { "truncated": { "type": "boolean" }, "columns": { "type": "array", "items": { "type": "string" } }, "rows": { "type": "array", "items": { "type": "array" }, "description": "Row values by column. A blob is an object with a `blob` key, never a bare string. A non-finite float (Infinity or -Infinity; NaN cannot occur) is an object with a `float` key holding that name as a string, never a bare number, since JSON has no numeral for either." }, "row_count": { "type": "integer" } }, "required": ["columns", "rows", "row_count"] },
                         "description": "Execute a read-only SELECT query",
                         "inputSchema": {
                             "type": "object",
@@ -1480,5 +1494,68 @@ mod tests {
             result.structured["rows"][1][0], "",
             "and keeps the empty string as a string"
         );
+    }
+
+    /// serde_json maps any non-finite f64 to `null`, so an untagged Infinity
+    /// would be indistinguishable from a genuine SQL NULL. Both directions
+    /// matter: this only checks that Infinity and -Infinity come back tagged
+    /// and distinguishable from each other and from null - a finite float and
+    /// a real NULL alongside them are covered separately below, so a fix that
+    /// tags every float can't sneak past this test alone.
+    #[test]
+    fn non_finite_floats_round_trip_distinguishably() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE nf (f REAL)"))
+            .expect("create");
+        server
+            .insert_data(&query_arg(
+                "INSERT INTO nf VALUES (1e999), (-1e999), (NULL)",
+            ))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_arg("SELECT f FROM nf"))
+            .expect("query succeeds");
+        let rows = &result.structured["rows"];
+
+        assert_eq!(
+            rows[0][0],
+            json!({ "float": "Infinity" }),
+            "Infinity must be tagged, not collapsed to null: {rows}"
+        );
+        assert_eq!(
+            rows[1][0],
+            json!({ "float": "-Infinity" }),
+            "-Infinity must be tagged and distinguishable from Infinity: {rows}"
+        );
+        assert!(
+            rows[2][0].is_null(),
+            "a genuine SQL NULL must still come back as null: {rows}"
+        );
+    }
+
+    /// The point of the guard above: it must not tag every float, only the
+    /// non-finite ones. An ordinary value has to survive as a plain number.
+    #[test]
+    fn an_ordinary_float_is_still_a_plain_json_number() {
+        let server = memory_server();
+        server
+            .schema_change(&query_arg("CREATE TABLE f (v REAL)"))
+            .expect("create");
+        server
+            .insert_data(&query_arg("INSERT INTO f VALUES (3.5)"))
+            .expect("insert");
+
+        let result = server
+            .execute_query(&query_arg("SELECT v FROM f"))
+            .expect("query succeeds");
+        let cell = &result.structured["rows"][0][0];
+
+        assert!(
+            cell.is_number(),
+            "a finite float must stay a bare JSON number, not an object: {cell}"
+        );
+        assert_eq!(cell.as_f64(), Some(3.5));
     }
 }
