@@ -29,9 +29,11 @@ fails at random with `ConnectionRefused` or `ConnectionReset`; serially all
 five pass. Two agents hit this independently and one nearly reported it as a
 regression in the code it was changing.
 
-Nobody has reproduced the race deliberately yet, so the cause is still open
-as [#41](https://github.com/wommy/turso/issues/41). Until that closes, the
-flag is how you tell a real failure from this one.
+The cause is understood and open as
+[#37](https://github.com/wommy/turso/issues/37): the fixture reserves a port,
+drops the listener, then spawns a child to bind it, and anything can take it in
+the window between. Until that closes, the flag is how you tell a real failure
+from this one.
 
 ## The inner loop
 
