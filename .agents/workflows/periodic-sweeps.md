@@ -62,6 +62,20 @@ pay off across branches, so they can run less often.
    go where the wrong claim lived.
 5. Record what came back **clean**. It bounds the claim and stops the next
    sweep redoing the same ground.
+6. **Check every document that cites an open ticket.** A limitation written
+   against a bug is a snapshot with an expiry date, and nothing watches for it:
+   three documents told readers `--mcp-http` could not serve a legacy client for
+   hours after the fix landed, and one told them a `400` was that bug rather
+   than their own configuration.
+
+   The finding is not "cites a closed issue" — citing one retrospectively is
+   correct and common. It is **describing a closed issue as pending**. Grep the
+   pending tense near a citation and check those numbers only:
+
+   ```
+   grep -rnE '(until it is fixed|known defect|not yet|does not work|tracked as)' \
+     --include='*.md' --include='*.mdx' --include='*.rs' . | grep -E '#[0-9]+'
+   ```
 
 ## The config sweep, because nobody audits the auditor
 

@@ -85,6 +85,10 @@ caught a false claim in a brief twice.
   disagree. Name the ADR and say you are deliberately not summarising it.
   Where an ADR already *is* the slice's spec — 0004 is slice 9's — the brief
   shrinks to the pointer, the file to change, and the one judgement call.
+- **Ask for a list of the defects it documented by number.** An agent writing
+  docs will faithfully record "this is broken, see #44" and has no way to know
+  the fix lands an hour later. Getting the list back at hand-off is cheaper than
+  finding it in a sweep, and it costs the agent one line.
 - **Require the negative proof.** For a bug fix, the tests must be shown to fail
   without the change. Upstream asks for this explicitly and it matters most when
   the tests were written by a model. Per ADR 0005 above; do not respell it.
