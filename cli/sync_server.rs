@@ -112,7 +112,6 @@ impl TursoSyncServer {
 
     fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
         let request_data = read_http_request(&mut stream)?;
 

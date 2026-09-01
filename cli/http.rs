@@ -1,9 +1,25 @@
 use std::io::Read;
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+/// How long one request may take to arrive, however slowly a client feeds
+/// it in. A flat `set_read_timeout` on its own is not enough: it resets on
+/// every byte received, so a client trickling in one byte just before each
+/// timeout elapses can hold the connection open indefinitely. This is the
+/// real budget; `read_http_request` re-derives its own socket timeout from
+/// it instead of trusting whatever the caller set.
+const READ_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a single `read()` may block before the loop below rechecks its
+/// deadline. Capping it well below the deadline itself means that check is
+/// reached again shortly after the budget runs out, instead of the loop
+/// sitting inside one blocking read for the whole remaining budget while a
+/// client trickles in just enough bytes to keep it from failing.
+const IO_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct HttpResponse {
     pub status: u16,
@@ -17,11 +33,27 @@ pub struct HttpResponse {
 }
 
 pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    read_http_request_by(stream, READ_DEADLINE)
+}
+
+/// Split out from `read_http_request` so a test can hand it a deadline of a
+/// few hundred milliseconds instead of waiting out the real 30 seconds to
+/// prove a silent client is refused.
+fn read_http_request_by(stream: &mut TcpStream, deadline: Duration) -> Result<Vec<u8>> {
+    stream.set_read_timeout(Some(IO_POLL_TIMEOUT.min(deadline)))?;
+    let started = Instant::now();
     let mut buffer = [0u8; 8192];
     let mut request_data = Vec::new();
 
     loop {
-        let n = stream.read(&mut buffer)?;
+        if started.elapsed() > deadline {
+            return Err(anyhow!("HTTP request took too long to arrive"));
+        }
+        let n = match stream.read(&mut buffer) {
+            Ok(n) => n,
+            Err(e) if is_io_timeout(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
@@ -50,7 +82,14 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
         if let Some(content_length) = parse_content_length(&headers)? {
             let total_expected = request_end(header_end, content_length)?;
             while request_data.len() < total_expected {
-                let n = stream.read(&mut buffer)?;
+                if started.elapsed() > deadline {
+                    return Err(anyhow!("HTTP request took too long to arrive"));
+                }
+                let n = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(e) if is_io_timeout(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 if n == 0 {
                     break;
                 }
@@ -65,6 +104,16 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
     }
 
     Ok(request_data)
+}
+
+/// A read timing out is not a failure on its own: it just means the poll
+/// interval elapsed with no data, so the loop above can recheck its real
+/// deadline instead of treating the timeout as the end of the world.
+fn is_io_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
@@ -294,5 +343,69 @@ mod tests {
     fn rejects_content_length_that_overflows() {
         assert!(request_end(0, usize::MAX).is_err());
         assert_eq!(request_end(10, 5).unwrap(), 19);
+    }
+
+    /// Mirrors what a caller used to set up by hand: a client that connects
+    /// and never sends a byte must be refused with a clear reason once the
+    /// deadline passes, rather than left to hang or read as a broken
+    /// connection. Uses a deadline of a few hundred milliseconds - the real
+    /// `READ_DEADLINE` is 30 seconds, and this only needs to prove the
+    /// budget is enforced, not spend 30 real seconds doing it.
+    #[test]
+    fn a_silent_client_is_refused_gracefully_once_the_deadline_passes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let client = TcpStream::connect(address).expect("connect");
+            // Never sends a byte, and stays connected well past the deadline
+            // below, instead of closing right away.
+            std::thread::sleep(Duration::from_secs(2));
+            drop(client);
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+
+        let error = read_http_request_by(&mut stream, Duration::from_millis(300))
+            .expect_err("a silent client is refused");
+
+        assert!(
+            error.to_string().contains("took too long"),
+            "expected a graceful refusal, got: {error}"
+        );
+    }
+
+    /// The other direction of the guard above: a client that is merely slow,
+    /// not silent, and finishes within its budget must still be served. Each
+    /// piece arrives further apart than `IO_POLL_TIMEOUT`, so the read loop
+    /// has to resume across more than one timed-out `read()` - but the whole
+    /// exchange still finishes well inside the deadline given here. Without
+    /// this, a deadline that fires on any pause at all, rather than one that
+    /// outlasts the budget, would pass every refusal test while refusing
+    /// every real client too.
+    #[test]
+    fn a_client_that_trickles_bytes_within_the_deadline_is_still_served() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let request = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nHELLO".to_vec();
+
+        std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            for chunk in request.chunks(request.len() / 3 + 1) {
+                stream.write_all(chunk).expect("write");
+                stream.flush().expect("flush");
+                std::thread::sleep(Duration::from_millis(700));
+            }
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+        let data = read_http_request_by(&mut stream, Duration::from_secs(5))
+            .expect("a slow but complete client must still be served");
+
+        let (_, _, _, body) = parse_http_request(&data).expect("request parses");
+        assert_eq!(body, b"HELLO");
     }
 }
