@@ -22,7 +22,11 @@ pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const INVALID_PARAMS: i32 = -32602;
 pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
 pub(crate) const HEADER_MISMATCH: i32 = -32020;
-pub(crate) const FORBIDDEN_ORIGIN: i32 = -32021;
+/// A refused Origin has no code of its own. `-32020` to `-32099` is reserved
+/// for the specification, which assigns no code to this case and forbids both
+/// inventing one in that range and reusing a defined code for another meaning.
+/// `-32021` is `MissingRequiredClientCapability`, so it is not available here.
+pub(crate) const FORBIDDEN_ORIGIN: i32 = INVALID_REQUEST;
 
 /// The tool list cannot change while the server runs, so a client may hold it
 /// for as long as it likes.

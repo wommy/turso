@@ -639,6 +639,6 @@ mod tests {
 
         assert_eq!(response.status, 403);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
-        assert_eq!(body["error"]["code"], -32021);
+        assert_eq!(body["error"]["code"], -32600);
     }
 }
