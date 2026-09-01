@@ -22,6 +22,11 @@ use std::time::Duration;
 /// anyone wrote down.
 const MAX_CONNECTIONS: usize = 64;
 
+/// The most `drain_briefly` reads off a refused connection before answering
+/// it. A bound rather than a timeout, because the read timeout below only
+/// limits one blocked read, not a client that keeps the bytes coming.
+const MAX_DRAIN_BYTES: usize = 64 * 1024;
+
 /// How long `reject_over_capacity` gives a socket it is about to refuse.
 /// The caller is already shedding load, so this is a short, best-effort
 /// budget rather than the request-handling deadline `handle_http_connection`
@@ -149,21 +154,40 @@ fn try_reserve_connection(active_connections: &AtomicUsize) -> bool {
 /// over `MAX_CONNECTIONS` is answered on a short timeout rather than given a
 /// thread of its own.
 fn reject_over_capacity(mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(REJECT_TIMEOUT));
-    // Closing a socket that still has unread bytes sitting in it makes the
-    // OS send a connection reset instead of a clean close, which looks like
-    // a broken connection rather than "503, please retry" - so drain
-    // whatever the client already sent first, within the same short budget.
-    let mut discard = [0u8; 8192];
-    while let Ok(n) = stream.read(&mut discard) {
-        if n < discard.len() {
-            break;
-        }
+    // An accepted socket can arrive non-blocking, and then both timeouts
+    // below do nothing and the 503 is never written - the same reason
+    // `handle_http_connection` opens with this line.
+    if stream.set_nonblocking(false).is_err() {
+        return;
     }
-
+    let _ = stream.set_read_timeout(Some(REJECT_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REJECT_TIMEOUT));
+
+    drain_briefly(&mut stream);
+
     let response = plain_text_response(503, b"Too many connections");
     let _ = stream.write_all(&format_http_response(&response));
+}
+
+/// Closing a socket that still holds unread bytes makes the OS send a
+/// connection reset instead of a clean close, so the client sees a broken
+/// connection rather than "503, please retry". Reads off what the client
+/// already sent to avoid that, then stops - on the first short read, or at
+/// `MAX_DRAIN_BYTES`, whichever comes first.
+///
+/// The byte budget is the load-bearing half. This runs on the accept loop,
+/// so a client that just keeps sending would otherwise block every other
+/// connection here, which is the head-of-line stall the thread per
+/// connection above exists to remove.
+fn drain_briefly(reader: &mut impl Read) {
+    let mut discard = [0u8; 8192];
+    let mut drained = 0;
+    while drained < MAX_DRAIN_BYTES {
+        match reader.read(&mut discard) {
+            Ok(n) if n == discard.len() => drained += n,
+            _ => break,
+        }
+    }
 }
 
 /// Which of the three ways `handle_http_connection` can dispose of a
@@ -1802,6 +1826,92 @@ mod tests {
             try_reserve_connection(&active_connections),
             "freeing a slot must let a new connection back in"
         );
+    }
+
+    /// The refusal a client past the cap actually sees. Worth a real socket
+    /// because the failure mode is not a wrong body but no body at all: a
+    /// dropped connection reads as a broken server rather than "try again".
+    #[test]
+    fn a_refused_connection_is_told_503_rather_than_just_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+
+        let mut client = TcpStream::connect(address).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        client
+            .write_all(b"POST /mcp HTTP/1.1\r\n\r\n")
+            .expect("write");
+
+        let (server_side, _) = listener.accept().expect("accept");
+        reject_over_capacity(server_side);
+
+        let mut refusal = String::new();
+        client.read_to_string(&mut refusal).expect("read refusal");
+        assert!(
+            refusal.starts_with("HTTP/1.1 503 "),
+            "expected a 503, got: {refusal}"
+        );
+    }
+
+    /// A reader that never runs out, standing in for a client that keeps
+    /// sending after it has been refused. Counts what it served so the test
+    /// can assert the drain stopped rather than that it merely returned.
+    struct EndlessReader {
+        served: usize,
+    }
+
+    impl Read for EndlessReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.served += buf.len();
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn draining_a_client_that_keeps_talking_stops_at_the_budget() {
+        let mut reader = EndlessReader { served: 0 };
+
+        drain_briefly(&mut reader);
+
+        assert!(
+            reader.served <= MAX_DRAIN_BYTES + 8192,
+            "drained {} bytes off a client that never stops, which is the \
+             accept loop stalling on one refused connection",
+            reader.served
+        );
+    }
+
+    /// A client that has said its piece: one short read, and any further
+    /// read is the bug this asserts against.
+    struct OneShortRead {
+        reads: usize,
+    }
+
+    impl Read for OneShortRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            assert_eq!(
+                self.reads, 1,
+                "read again after a short read, so a refused connection sits \
+                 on the accept loop waiting out its read timeout"
+            );
+            buf[..4].copy_from_slice(b"POST");
+            Ok(4)
+        }
+    }
+
+    /// The other direction: the budget must not turn every refused
+    /// connection into reads the client will never answer. One short read
+    /// says the client is done, and the drain must take that for an answer.
+    #[test]
+    fn draining_stops_as_soon_as_the_client_goes_quiet() {
+        let mut reader = OneShortRead { reads: 0 };
+
+        drain_briefly(&mut reader);
+
+        assert_eq!(reader.reads, 1);
     }
 
     /// The one claim in this file that needs real timing rather than the
