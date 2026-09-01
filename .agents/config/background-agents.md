@@ -111,57 +111,33 @@ make one up, which is how SQLite 3.45.1 ended up standing in for a pinned 3.50.4
 | The change wants a file the brief did not name | Report that, rather than widening. Two commits beat one that does two things. |
 | Anything else | Report `job: could_not` with the evidence. A good outcome, and the only sanctioned exit. |
 
-## Structured in, structured out
+## What a verification report has to separate
 
-For a verification job, brief and report are both schemas — read the fields, not
-the prose around them:
+There were JSON Schemas here for the brief and the report. They were written
+before any agent had run, went a full day and roughly a dozen dispatches without
+being used once — including by the one job that fit their stated case — and were
+never revised. Speculative generality; deleted in the sweep that found them.
+`git log -- .agents/config/` has them if a real need turns up.
 
-- **[`agent-brief.schema.json`](./agent-brief.schema.json)** — what the agent is given.
-- **[`agent-report.schema.json`](./agent-report.schema.json)** — what it writes back.
+The distinctions they encoded were the valuable part, and those are in use:
 
-### Two channels, not one status
-
-The report separates **what you did** from **what you found**, the split Effect
-and ZIO make with their error and success channels (`Effect<A, E, R>`,
-`ZIO[R, E, A]`).
-
-- **`job`** — did the agent complete its assignment? `done`, `could_not`,
-  `deviated`, `interrupted`.
-- **`result`** — what the checks found: `pass` or `fail`. Meaningful only when
-  `job` is `done`.
+**`job` and `result` are separate.** `job` is whether the agent completed its
+assignment (`done`, `could_not`, `deviated`, `interrupted`); `result` is what the
+checks found (`pass`, `fail`), and means nothing unless `job` is `done`.
 
 A failing test is `job: done, result: fail` — a completed job reporting a real
-finding. Collapsing those into one status is what creates the pressure: an agent
-that believes a red result reflects on *it* will look for a way to turn the
-result green. Once "the tests failed" is a successful outcome of the job "run the
-tests", that pressure is gone.
+finding. Collapsing the two creates the pressure: an agent that believes a red
+result reflects on *it* will look for a way to turn the result green.
 
-| | Ours | Example |
-|---|---|---|
-| Expected failure | `result: fail` | a suite stopped on a real condition |
-| Defect | `job: deviated` | substituting SQLite 3.45.1 for the pinned 3.50.4 |
-| Interruption | `job: interrupted` | two agents killed mid-run by a usage limit |
-| Unmet requirement | `job: could_not` | the pinned binary could not be downloaded |
+**Deviations are self-reported.** Doing something the brief forbade is
+recoverable; concealing it is not, because every later decision then rests on a
+result nobody can trust. Substituting SQLite 3.45.1 for the pinned 3.50.4 is the
+worked example, below.
 
-`deviations[]` is where a defect gets self-reported. Doing something the brief
-forbade is recoverable; concealing it is not, because every later decision then
-rests on a result nobody can trust.
-
-### Requirements are declared, not discovered
-
-The brief's `requires[]` is the third channel: preconditions, each with a command
-that exits 0 when met, checked **before** anything runs. An unmet requirement
-makes the job `could_not` on its own.
-
-This matters more than it looks. "Blocked" as a mid-run judgement asks the agent,
-at exactly the wrong moment, whether a workaround is acceptable. As a
-precondition it asks nothing — the requirement is either met or it is not.
-
-This is the same argument the MCP work itself makes. The old server returned
-failures as successful results whose text happened to say "Error", so a model
-could not tell success from failure — which is why the port adds `isError` and
-`structuredContent`. Briefing our own agents in prose was the identical mistake,
-one layer up.
+**Preconditions are checked before anything runs**, each a command that exits 0
+when met. An unmet one ends the job on its own — which is the point: "am I
+blocked?" as a mid-run judgement asks the agent whether a workaround is
+acceptable, at exactly the wrong moment. Asked up front it asks nothing.
 
 ## Negative proof has to isolate the test
 

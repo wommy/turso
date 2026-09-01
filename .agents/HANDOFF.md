@@ -60,19 +60,9 @@ They are now the only things in the map's fog.
   connected. Everything is verified against the spec text and against tests
   written from the same reading of it, which cannot catch a shared misreading.
 
-## What this session learned, and where it is written down
-
-Not repeated here. Each lives in a document that is the source of truth for it:
-
-- Verify every agent claim at source — `.agents/config/verify-agent-claims.md`,
-  which keeps the running list of what that has caught.
-- One agent per **worktree**, pre-load briefs rather than describing —
-  `.agents/config/background-agents.md`.
-- Pointers, not snapshots — `.agents/workflows/pr-drive-to-green.md`, and this
-  file's own opening paragraph.
-
 ## Suggested skills
 
-`tdd` for the remaining slices (seams named in #24). `two-axis-review` before
-anything is offered upstream. **Not `wayfinder`** — its map has cleared; what
+`tdd` for the remaining slices. **`two-axis-review`** before anything is offered
+upstream — that alias matters, because the bare name `code-review` resolves to
+the harness built-in instead. **Not `wayfinder`**: its map has cleared and what
 remains is execution.
