@@ -32,10 +32,17 @@ convention in this organisation — `tursodatabase/turso-mcp` uses `.agents/` fo
 exactly this purpose.
 
 The cost is that a skill following its own documented default will look in
-`docs/agents/issue-tracker.md` and find nothing. That is acceptable because the
-skills are read from a clone rather than installed, so the paths are ours to
-choose; `AGENTS.md` points at the real locations for anyone who arrives without
-that context.
+`docs/agents/issue-tracker.md` and find nothing. That cost was called acceptable
+here before it was measured; measuring it made it more specific, not smaller.
+`code-review/SKILL.md:13` hard-codes that path and, when it is missing, tells the
+reader to **re-run `/setup-matt-pocock-skills`** — the wrong instruction, since
+the file exists at `.agents/config/issue-tracker.md`. Line 29 uses the same path.
+
+Still accepted: the skills are read from a clone rather than installed, so the
+reader who hits that message is an agent that can be told otherwise, and
+`AGENTS.md` names the real locations. But the symptom is now written down so it
+is recognised rather than debugged — **if a skill tells you to re-run setup, it
+is wrong, and the file is under `.agents/config/`.**
 
 ## Consequences
 
@@ -53,9 +60,16 @@ worktrees where the code actually gets written. An agent sent into a feature
 worktree cannot see these ADRs or the glossary, and will happily re-open a
 decision recorded three directories away — which has already happened, with an
 architecture review reasoning about HTTP libraries that ADR 0002 rules out. The
-fix is to symlink `.agents/` into each worktree and list them in
-`.git/info/exclude`, which is shared across all worktrees and keeps them out of
-`git status`.
+fix is to symlink this directory into each worktree as **`.agents-ref`** and
+exclude that name.
+
+The name matters, and the obvious choice was wrong. `.git/info/exclude` lives in
+the common git directory and applies to every worktree, including this one; a
+per-worktree `$GIT_DIR/info/exclude` was tried and git does not read it. So
+excluding `/.agents` also hid the **tracked** directory here — a new ADR written
+on this branch returned nothing at all from `git status --porcelain`, not even
+as untracked. That is silent loss, not an inconvenience. Excluding a name that
+exists only as a symlink keeps this branch honest.
 
 Untracked copies from the rejected option above must not be left behind. A
 stray `CONTEXT.md` in another worktree competes with this one, and the reader
