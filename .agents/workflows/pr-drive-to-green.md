@@ -65,6 +65,24 @@ Only when a checkpoint fires, or when a PR reaches green and mergeable for the
 first time. Under 150 words: which PR, which check, what failed, what was tried,
 and the decision needed.
 
+## Two ways this loop dies quietly
+
+Both are failure modes with no symptom, which is what makes them worth naming.
+
+**The re-arm is a numbered step, not a guarantee.** The trigger is a one-shot;
+if step 7 is skipped, or the session owning it ends mid-run, the loop simply
+stops and nothing anywhere notices. There is no watchdog. Until there is, treat
+a long silence from this loop as evidence it is dead rather than evidence that
+nothing is wrong.
+
+**A pointer can rot as surely as a snapshot.** Issue #24's body has already been
+rewritten once, superseding claims an earlier version of it asserted. Pointing at
+a mutable target relocates staleness, it does not remove it. So before acting on
+what a pointer says, check that it is current - an `updated_at`, a supersession
+notice, a head SHA that matches. That is the same discipline
+`../config/verify-agent-claims.md` demands of a subagent report, and there is no
+reason a document gets a pass a report would not.
+
 ## Definition of done
 
 Every watched PR is merged or closed. Until then the loop re-arms, including
