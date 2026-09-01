@@ -1,6 +1,6 @@
 use super::protocol::{
     JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH, INVALID_PARAMS,
-    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
+    INVALID_REQUEST, LENGTH_REQUIRED, METHOD_NOT_FOUND, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use super::TursoMcpServer;
 use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
@@ -138,6 +138,9 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
             return forbidden_origin(origin);
         }
     }
+    if has_chunked_transfer_encoding(req) {
+        return length_required();
+    }
     if !is_notification(&req.body) {
         if let Err(response) = validate_headers(req) {
             return response;
@@ -258,6 +261,39 @@ fn forbidden_origin(origin: &str) -> HttpResponse {
     let response = JsonRpcResponse::failure(None, error);
     HttpResponse {
         status: 403,
+        content_type: "application/json".to_string(),
+        body: serde_json::to_vec(&response).unwrap_or_default(),
+        extra_headers: Vec::new(),
+    }
+}
+
+/// `Transfer-Encoding` can list more than one coding (`gzip, chunked`), and
+/// RFC 9112 requires `chunked` to be the last one when present at all, so a
+/// bare substring check on the raw header would work here too - but checking
+/// each comma-separated token instead means a coding that merely contains the
+/// word, or a stray comma, cannot produce a false match.
+fn has_chunked_transfer_encoding(req: &HttpRequest) -> bool {
+    req.header("Transfer-Encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+/// ADR 0004: this server understands `Content-Length` and nothing else, so a
+/// chunked body - which `read_http_request` cannot frame, having already
+/// looked for `Content-Length` and found none by the time this runs - is
+/// refused outright rather than misread as empty. The id is always null for
+/// the same reason `forbidden_origin` uses one: the body cannot be trusted
+/// enough to parse just to echo its id back.
+fn length_required() -> HttpResponse {
+    let error = JsonRpcError::new(
+        LENGTH_REQUIRED,
+        "Transfer-Encoding: chunked is not supported; send Content-Length instead".to_string(),
+    );
+    let response = JsonRpcResponse::failure(None, error);
+    HttpResponse {
+        status: 411,
         content_type: "application/json".to_string(),
         body: serde_json::to_vec(&response).unwrap_or_default(),
         extra_headers: Vec::new(),
@@ -1194,5 +1230,100 @@ mod tests {
         assert_eq!(response.status, 403);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
         assert_eq!(body["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn a_bare_chunked_transfer_encoding_is_detected() {
+        let req = HttpRequest {
+            headers: vec![("Transfer-Encoding".to_string(), "chunked".to_string())],
+            body: Vec::new(),
+        };
+        assert!(has_chunked_transfer_encoding(&req));
+    }
+
+    #[test]
+    fn chunked_listed_alongside_another_coding_is_still_detected() {
+        let req = HttpRequest {
+            headers: vec![("Transfer-Encoding".to_string(), "gzip, chunked".to_string())],
+            body: Vec::new(),
+        };
+        assert!(has_chunked_transfer_encoding(&req));
+    }
+
+    /// The other direction of the token-split logic: a coding that is not
+    /// `chunked` - `gzip` alone, say - must not trip a check meant only for
+    /// the one framing this server cannot read.
+    #[test]
+    fn a_transfer_encoding_that_is_not_chunked_is_not_detected() {
+        let req = HttpRequest {
+            headers: vec![("Transfer-Encoding".to_string(), "gzip".to_string())],
+            body: Vec::new(),
+        };
+        assert!(!has_chunked_transfer_encoding(&req));
+    }
+
+    #[test]
+    fn no_transfer_encoding_header_is_not_detected() {
+        let req = HttpRequest {
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(!has_chunked_transfer_encoding(&req));
+    }
+
+    /// ADR 0004: a chunked body is refused outright. A body and header that
+    /// would pass every other check - a well-formed `tools/list` request
+    /// with a matching `Mcp-Method` - proves the refusal fires regardless,
+    /// the same way `a_request_with_a_forbidden_origin_is_rejected_before_
+    /// the_body_is_even_read` proves it for the Origin guard. Against
+    /// unchanged code this same request returns 200, per the worktree
+    /// comparison recorded in the commit that added this test.
+    #[test]
+    fn a_request_with_a_chunked_transfer_encoding_is_refused_with_411() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 411);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32600);
+    }
+
+    /// Mirrors `a_notification_with_a_forbidden_origin_is_still_rejected`:
+    /// framing applies to every request whether or not it carries an `id`,
+    /// unlike the request-metadata headers a notification gets a pass on.
+    #[test]
+    fn a_notification_with_a_chunked_transfer_encoding_is_still_refused() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Transfer-Encoding".to_string(), "chunked".to_string())],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 411);
     }
 }

@@ -138,6 +138,7 @@ pub fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        411 => "Length Required",
         500 => "Internal Server Error",
         _ => "Unknown",
     };
@@ -177,7 +178,7 @@ mod tests {
     /// went out as `HTTP/1.1 400 Unknown` for three slices because of that.
     #[test]
     fn every_status_the_mcp_transport_sends_has_a_reason_phrase() {
-        for status in [200, 202, 400, 403, 404, 405] {
+        for status in [200, 202, 400, 403, 404, 405, 411] {
             let response = HttpResponse {
                 status,
                 content_type: "application/json".to_string(),

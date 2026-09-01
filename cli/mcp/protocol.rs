@@ -27,6 +27,10 @@ pub(crate) const HEADER_MISMATCH: i32 = -32020;
 /// inventing one in that range and reusing a defined code for another meaning.
 /// `-32021` is `MissingRequiredClientCapability`, so it is not available here.
 pub(crate) const FORBIDDEN_ORIGIN: i32 = INVALID_REQUEST;
+/// A chunked request body has no code of its own either, for the same reason
+/// `FORBIDDEN_ORIGIN` reuses `INVALID_REQUEST` above: this is a framing
+/// refusal (ADR 0004), not a case the specification assigns a code to.
+pub(crate) const LENGTH_REQUIRED: i32 = INVALID_REQUEST;
 
 /// The tool list cannot change while the server runs, so a client may hold it
 /// for as long as it likes.
