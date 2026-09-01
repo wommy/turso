@@ -1,6 +1,7 @@
 use super::protocol::{
-    JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH, INVALID_PARAMS,
-    INVALID_REQUEST, LENGTH_REQUIRED, METHOD_NOT_FOUND, PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH,
+    INVALID_PARAMS, INVALID_REQUEST, LENGTH_REQUIRED, METHOD_NOT_FOUND, PARSE_ERROR,
+    UNSUPPORTED_PROTOCOL_VERSION,
 };
 use super::TursoMcpServer;
 use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
@@ -141,9 +142,15 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
     if has_chunked_transfer_encoding(req) {
         return length_required();
     }
-    if !is_notification(&req.body) {
-        if let Err(response) = validate_headers(req) {
-            return response;
+    // Parsed once and shared between the header check below and the era
+    // decision it depends on, rather than each re-deriving its own view of
+    // the body.
+    let request = serde_json::from_slice::<JsonRpcRequest>(&req.body).ok();
+    if let Some(request) = &request {
+        if requires_header_validation(request) {
+            if let Err(response) = validate_headers(req, request) {
+                return response;
+            }
         }
     }
     let body = server
@@ -182,11 +189,11 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
 ///
 /// A notification has no response at all: `handle_message` gives back
 /// `None`, which `http_response_for` turns into an empty string before this
-/// function ever sees it - and, per `is_notification`, never reaches
-/// `validate_headers` either. An empty body only ever means a notification
-/// was accepted, so it gets the `202 Accepted` the spec requires for that
-/// case (MUST, `streamable-http.mdx` L86-88), not the `200` an ordinary
-/// JSON-RPC response gets.
+/// function ever sees it - and, per `requires_header_validation`, never
+/// reaches `validate_headers` either. An empty body only ever means a
+/// notification was accepted, so it gets the `202 Accepted` the spec
+/// requires for that case (MUST, `streamable-http.mdx` L86-88), not the
+/// `200` an ordinary JSON-RPC response gets.
 fn http_status_for(body: &str) -> u16 {
     if body.is_empty() {
         return 202;
@@ -300,51 +307,48 @@ fn length_required() -> HttpResponse {
     }
 }
 
-/// A JSON-RPC message with no `id` field is a notification - the same test
-/// `handle_message` (`cli/mcp/mod.rs`) makes on `raw.get("id")` to decide
-/// whether to answer at all. `http_response_for` uses it to decide whether
-/// `validate_headers` runs: the spec defines no header requirements for a
-/// notification POST (`streamable-http.mdx` L101-103, this revision), so
-/// enforcing the request-metadata headers on one would reject a conforming
-/// client. `Origin` is unaffected - it is checked in `http_response_for`
-/// before this, not inside `validate_headers`, because it is the
-/// DNS-rebinding defense (MUST, L57-63) rather than a request-metadata
-/// header, and applies to every request regardless of `id`.
+/// Whether `validate_headers` applies to this request at all. Its headers -
+/// `Mcp-Method`, `Mcp-Name` - are `2026-07-28` inventions (MUST,
+/// `streamable-http.mdx` L253-297), and a dual-era server picks its behavior
+/// from how the client opens (MUST, `basic/versioning.mdx` L175-180): a
+/// request carrying modern per-request `_meta` is served under this
+/// revision, everything else - including an `initialize` handshake - under
+/// legacy semantics, which defines no header requirements at all. So the
+/// header check belongs on the modern branch of that fork, not ahead of it.
 ///
-/// A body that fails to parse as JSON is not a notification: `handle_message`
-/// itself answers that case with a `PARSE_ERROR` response rather than
-/// silence, so its headers are still validated, unchanged from before this
-/// function existed.
-fn is_notification(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .is_some_and(|value| value.get("id").is_none())
+/// `declares_v2` (`protocol.rs`) is the version test already used to scope
+/// the stdio-side v2-only checks, reused rather than re-derived: presence of
+/// `_meta` is not itself the modern signal - the official client sends an
+/// empty `_meta: {}` on every request even while handshaking at an earlier
+/// revision - only the `protocolVersion` named inside it is.
+///
+/// A request with no `id` is a notification, which the spec exempts from
+/// header requirements outright regardless of era (`streamable-http.mdx`
+/// L101-103) - checked first so that stays true whatever `declares_v2` says.
+/// `Origin` is unaffected by any of this - it is checked in
+/// `http_response_for` before a request even reaches this function, because
+/// it is the DNS-rebinding defense (MUST, L57-63) rather than a
+/// request-metadata header, and applies regardless of era or `id`.
+///
+/// A body that fails to parse into a `JsonRpcRequest` at all declares
+/// nothing, modern or otherwise; `http_response_for` already treats that the
+/// same as "does not require validation" by never calling this function for
+/// it, and `handle_message` reports the parse failure itself.
+fn requires_header_validation(request: &JsonRpcRequest) -> bool {
+    request.id.is_some() && request.declares_v2()
 }
 
 /// The spec's request-metadata headers, checked against the JSON-RPC body
 /// before the request is routed at all - a mismatch must never reach a tool.
-///
-/// Header presence, duplicates, and character validity are checked whether
-/// or not the body parses as JSON: a client that sends no `Mcp-Method` at
-/// all must get the same 400 whether its body is `{"method":...}` or
-/// garbage. Only the comparison *against* a body value needs that value, so
-/// an unparseable body short-circuits after the header-only checks - the
-/// parse error itself is reported by `handle_message` below, not duplicated
-/// here.
-fn validate_headers(req: &HttpRequest) -> Result<(), HttpResponse> {
-    let parsed_body = serde_json::from_slice::<Value>(&req.body).ok();
-    let id = parsed_body
-        .as_ref()
-        .and_then(|body| body.get("id").cloned());
+/// Only reached once `requires_header_validation` has confirmed the request
+/// is modern, so `request` is always the same parse `http_response_for`
+/// already made; this does not re-derive it from `req.body`.
+fn validate_headers(req: &HttpRequest, request: &JsonRpcRequest) -> Result<(), HttpResponse> {
+    let id = request.id.clone();
+    let body_method = request.method.as_str();
 
     let header_method = checked_header(req, "Mcp-Method", id.clone())?
         .ok_or_else(|| header_mismatch(id.clone(), "Missing required header: Mcp-Method"))?;
-
-    let Some(request) = parsed_body else {
-        return Ok(());
-    };
-
-    let body_method = request.get("method").and_then(Value::as_str).unwrap_or("");
     if header_method != body_method {
         return Err(header_mismatch(
             id,
@@ -364,7 +368,8 @@ fn validate_headers(req: &HttpRequest) -> Result<(), HttpResponse> {
             "name"
         };
         let body_name = request
-            .get("params")
+            .params
+            .as_ref()
             .and_then(|params| params.get(name_field))
             .and_then(Value::as_str)
             .unwrap_or("");
@@ -496,6 +501,7 @@ fn header_mismatch(id: Option<Value>, message: impl Into<String>) -> HttpRespons
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::{LEGACY_DEFAULT, PROTOCOL_V2};
     use super::*;
     use serde_json::{json, Value};
     use std::sync::atomic::AtomicUsize;
@@ -507,6 +513,22 @@ mod tests {
             Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
                 .expect("open memory database");
         TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)), false)
+    }
+
+    /// The `_meta` shape that makes a request modern - `protocolVersion` is
+    /// the one field `requires_header_validation` actually keys on, but
+    /// `clientCapabilities` is included too so a request built with this
+    /// helper reaches the tool dispatch these tests care about instead of
+    /// being turned back earlier by `check_client_capabilities`
+    /// (`protocol.rs`), a body-level v2 requirement unrelated to what these
+    /// tests exercise. A test that wants to exercise the legacy branch
+    /// instead omits `_meta` altogether, or - to prove the trap in #44 -
+    /// uses an empty `_meta: {}` on purpose.
+    fn v2_meta() -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": PROTOCOL_V2,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        })
     }
 
     #[test]
@@ -597,7 +619,6 @@ mod tests {
     /// carrying `INVALID_PARAMS` in the body.
     #[test]
     fn a_v2_tools_call_missing_client_capabilities_returns_400() {
-        use super::super::protocol::PROTOCOL_V2;
         let server = memory_server();
         let request_body = json!({
             "jsonrpc": "2.0",
@@ -657,6 +678,12 @@ mod tests {
         assert_eq!(route_request("POST", ENDPOINT_PATH), Route::Handle);
     }
 
+    /// The one substitution `basic/versioning.mdx` L175-180 asks for on top
+    /// of the pre-fix version of this test: a body that declares
+    /// `2026-07-28` in `_meta`, so the request is actually modern and this
+    /// still exercises `validate_headers` at all - see
+    /// `a_legacy_request_with_a_disagreeing_mcp_method_header_is_still_accepted`
+    /// below for the direction that fails without the fix.
     #[test]
     fn an_mcp_method_header_that_disagrees_with_the_body_method_is_rejected() {
         let server = memory_server();
@@ -664,7 +691,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "list_tables", "arguments": {} },
+            "params": { "name": "list_tables", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -681,13 +708,13 @@ mod tests {
     }
 
     #[test]
-    fn a_request_missing_the_mcp_method_header_entirely_is_rejected() {
+    fn a_modern_request_missing_the_mcp_method_header_entirely_is_rejected() {
         let server = memory_server();
         let request_body = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {},
+            "params": { "_meta": v2_meta() },
         })
         .to_string();
 
@@ -710,7 +737,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "list_tables", "arguments": {} },
+            "params": { "name": "list_tables", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -733,7 +760,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "bar", "arguments": {} },
+            "params": { "name": "bar", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -762,7 +789,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "list_tables\u{0007}", "arguments": {} },
+            "params": { "name": "list_tables\u{0007}", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -793,7 +820,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "list_tables", "arguments": {} },
+            "params": { "name": "list_tables", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -818,7 +845,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {},
+            "params": { "_meta": v2_meta() },
         })
         .to_string();
 
@@ -835,12 +862,16 @@ mod tests {
         assert_eq!(response.status, 200);
     }
 
-    /// A malformed body must not make header validation a no-op: the missing
-    /// `Mcp-Method` header is rejected the same way it would be with a valid
-    /// body, instead of falling through to `handle_message` and coming back
-    /// 200 with an embedded JSON-RPC parse error.
+    /// Before the dual-era fix, header validation ran ahead of any era
+    /// check, so a body that fails to parse at all was still held to the
+    /// missing-`Mcp-Method` rule and answered `HEADER_MISMATCH`. A body that
+    /// cannot even be read as a `JsonRpcRequest` cannot declare `_meta`,
+    /// modern or otherwise, so `requires_header_validation` never runs on
+    /// it now, and the request falls through to `handle_message`, which
+    /// reports the real problem: the body does not parse, `PARSE_ERROR`,
+    /// still a `400`.
     #[test]
-    fn an_unparseable_body_with_no_mcp_method_header_is_still_rejected() {
+    fn an_unparseable_body_answers_parse_error_not_header_mismatch() {
         let server = memory_server();
         let req = HttpRequest {
             headers: vec![],
@@ -851,7 +882,7 @@ mod tests {
 
         assert_eq!(response.status, 400);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
-        assert_eq!(body["error"]["code"], -32020);
+        assert_eq!(body["error"]["code"], PARSE_ERROR);
     }
 
     /// The character check exists to police the two headers this function
@@ -864,7 +895,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {},
+            "params": { "_meta": v2_meta() },
         })
         .to_string();
 
@@ -888,7 +919,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list\u{0007}",
-            "params": {},
+            "params": { "_meta": v2_meta() },
         })
         .to_string();
 
@@ -916,7 +947,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "café", "arguments": {} },
+            "params": { "name": "café", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
         let encoded = base64::engine::general_purpose::STANDARD.encode("café");
@@ -949,7 +980,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "something_else", "arguments": {} },
+            "params": { "name": "something_else", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
         let encoded = base64::engine::general_purpose::STANDARD.encode("café");
@@ -976,7 +1007,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "list_tables", "arguments": {} },
+            "params": { "name": "list_tables", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -1005,7 +1036,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "café", "arguments": {} },
+            "params": { "name": "café", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -1040,7 +1071,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "café", "arguments": {} },
+            "params": { "name": "café", "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
         let encoded = base64::engine::general_purpose::STANDARD.encode("café");
@@ -1072,7 +1103,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": literal_name, "arguments": {} },
+            "params": { "name": literal_name, "arguments": {}, "_meta": v2_meta() },
         })
         .to_string();
 
@@ -1325,5 +1356,118 @@ mod tests {
         let response = http_response_for(&server, &req);
 
         assert_eq!(response.status, 411);
+    }
+
+    /// #44, reproduced byte-for-byte: the official Python SDK's opening
+    /// `initialize`, captured with a header sink - `accept` and
+    /// `content-type` only, none of the `2026-07-28` routing headers, and an
+    /// empty `_meta` the client sends on every request even while
+    /// handshaking at `2025-11-25`. A dual-era server picks legacy semantics
+    /// for an `initialize` (MUST, `basic/versioning.mdx` L175-180), which
+    /// defines no header requirements at all - this must be served, not
+    /// turned back for headers a legacy client has no way to send.
+    #[test]
+    fn a_legacy_initialize_with_only_the_captured_headers_is_served() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "mcp", "version": "0.1.0" },
+                "_meta": {},
+            },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                (
+                    "accept".to_string(),
+                    "application/json, text/event-stream".to_string(),
+                ),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert!(body["error"].is_null(), "{body}");
+        // `2025-11-25` is not in `SUPPORTED_VERSIONS` yet (#43, tracked
+        // separately), so `handle_initialize` answers with `LEGACY_DEFAULT`
+        // rather than echoing the asked-for version - this test is only
+        // about the request being served at all, not about which legacy
+        // version it is served as.
+        assert_eq!(body["result"]["protocolVersion"], LEGACY_DEFAULT);
+    }
+
+    /// The trap #44 warns about, isolated from `initialize` so it is clear
+    /// this is about `_meta` and not about the method: the official client
+    /// sends an empty `_meta: {}` on every request, including ones after the
+    /// handshake, so presence of the key cannot be what marks a request
+    /// modern - only the `protocolVersion` named inside it can
+    /// (`declares_v2`, `protocol.rs`). A `tools/call` with an empty `_meta`
+    /// and none of the routing headers must still be served; if presence of
+    /// `_meta` alone were read as "modern", this would wrongly demand
+    /// `Mcp-Method`/`Mcp-Name` and fail with `HEADER_MISMATCH` instead.
+    #[test]
+    fn an_empty_meta_object_is_treated_as_legacy_not_modern() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_tables", "arguments": {}, "_meta": {} },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200, "{:?}", response.body);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["result"]["isError"], false, "{body}");
+    }
+
+    /// The false-positive direction ADR 0005 asks for, and the bug in #44
+    /// stated directly: a legacy request (no `_meta` declaring `2026-07-28`)
+    /// whose `Mcp-Method` header disagrees with the body - or is missing
+    /// outright - must still be served, because that header is a
+    /// modern-only invention this client has no reason to send correctly,
+    /// or to send at all. Against the pre-fix code, both of these were
+    /// refused with `HEADER_MISMATCH`.
+    #[test]
+    fn a_legacy_request_with_a_disagreeing_mcp_method_header_is_still_accepted() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        .to_string();
+
+        let disagreeing = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "tools/call".to_string())],
+            body: request_body.clone().into_bytes(),
+        };
+        let response = http_response_for(&server, &disagreeing);
+        assert_eq!(response.status, 200, "{:?}", response.body);
+
+        let missing = HttpRequest {
+            headers: vec![],
+            body: request_body.into_bytes(),
+        };
+        let response = http_response_for(&server, &missing);
+        assert_eq!(response.status, 200, "{:?}", response.body);
     }
 }
