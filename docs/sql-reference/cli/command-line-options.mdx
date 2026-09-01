@@ -123,6 +123,18 @@ Start a Model Context Protocol server instead of the interactive shell. This all
 tursodb --mcp mydata.db
 ```
 
+### `--mcp-http <ADDRESS>`
+
+Start a Model Context Protocol server over HTTP instead of the interactive shell, listening at the given address. Requests are POSTed as JSON-RPC to `/mcp`.
+
+```bash
+tursodb --mcp-http 127.0.0.1:8081 mydata.db
+```
+
+<Warning>
+Serves both the `2026-07-28` revision and the older `initialize` handshake. Connections are handled one at a time - run `.manual mcp` in the shell for details and limitations.
+</Warning>
+
 ### `--sync-server <ADDRESS>`
 
 Start a sync server for database replication, listening at the given address.

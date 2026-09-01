@@ -29,6 +29,16 @@ pub(crate) const INVALID_REQUEST: i32 = -32600;
 pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const INVALID_PARAMS: i32 = -32602;
 pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+pub(crate) const HEADER_MISMATCH: i32 = -32020;
+/// A refused Origin has no code of its own. `-32020` to `-32099` is reserved
+/// for the specification, which assigns no code to this case and forbids both
+/// inventing one in that range and reusing a defined code for another meaning.
+/// `-32021` is `MissingRequiredClientCapability`, so it is not available here.
+pub(crate) const FORBIDDEN_ORIGIN: i32 = INVALID_REQUEST;
+/// A chunked request body has no code of its own either, for the same reason
+/// `FORBIDDEN_ORIGIN` reuses `INVALID_REQUEST` above: this is a framing
+/// refusal (ADR 0004), not a case the specification assigns a code to.
+pub(crate) const LENGTH_REQUIRED: i32 = INVALID_REQUEST;
 
 /// The tool list cannot change while the server runs, so a client may hold it
 /// for as long as it likes.
@@ -125,7 +135,14 @@ impl JsonRpcRequest {
         self.meta()?.get(META_PROTOCOL_VERSION)?.as_str()
     }
 
-    fn declares_v2(&self) -> bool {
+    /// The dual-era fork a server selects behavior from (MUST,
+    /// `basic/versioning.mdx` L175-180): true for a request carrying modern
+    /// per-request `_meta`, false for everything else, `initialize` included.
+    /// Also used by the HTTP transport to scope its `2026-07-28`-only
+    /// routing headers the same way this module scopes `clientCapabilities`
+    /// below - a client that has not declared this revision has no header to
+    /// check.
+    pub(crate) fn declares_v2(&self) -> bool {
         self.protocol_version() == Some(PROTOCOL_V2)
     }
 

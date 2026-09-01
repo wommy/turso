@@ -1,3 +1,4 @@
+mod http;
 mod protocol;
 mod stdio;
 mod tools;

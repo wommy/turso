@@ -19,6 +19,7 @@ path = "main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 cfg-if = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }

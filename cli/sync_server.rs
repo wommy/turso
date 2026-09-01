@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -12,6 +12,10 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
+use crate::http::{
+    format_http_response, parse_http_request, read_http_request, write_response_bounded,
+    HttpResponse,
+};
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
@@ -37,7 +41,15 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
-const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+/// Total time a response may take to leave the socket. `read_http_request`'s
+/// own deadline covers the request side; without a matching one here, a
+/// client that stops reading its response would block `write_all` forever -
+/// and because this server handles one connection at a time (see `run`'s
+/// accept loop), that stalled write would wedge every other client too, the
+/// same way an unbounded read would. Longer than the read side because a
+/// pull-updates response can carry a whole database's worth of pages.
+const WRITE_DEADLINE: Duration = Duration::from_secs(120);
 
 pub struct TursoSyncServer {
     address: String,
@@ -112,44 +124,10 @@ impl TursoSyncServer {
 
     fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-        let mut buffer = [0u8; 8192];
-        let mut request_data = Vec::new();
+        let request_data = read_http_request(&mut stream)?;
 
-        loop {
-            let n = stream.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            // Bytes before this offset hold no terminator, and one can still
-            // straddle the last three of them.
-            let unscanned = request_data.len().saturating_sub(3);
-            request_data.extend_from_slice(&buffer[..n]);
-
-            let Some(header_end) = find_header_end(&request_data, unscanned) else {
-                if request_data.len() > MAX_HEADER_BYTES {
-                    return Err(anyhow!(
-                        "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
-                    ));
-                }
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request_data[..header_end]);
-            if let Some(content_length) = parse_content_length(&headers) {
-                let total_expected = request_end(header_end, content_length)?;
-                while request_data.len() < total_expected {
-                    let n = stream.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    request_data.extend_from_slice(&buffer[..n]);
-                }
-            }
-            break;
-        }
-
-        let (method, path, body) = parse_http_request(&request_data)?;
+        let (method, path, _headers, body) = parse_http_request(&request_data)?;
         info!("Request: {} {}", method, path);
 
         let response = match (method.as_str(), path.as_str()) {
@@ -157,6 +135,7 @@ impl TursoSyncServer {
                 status: 204,
                 content_type: "text/plain".to_string(),
                 body: Vec::new(),
+                extra_headers: cors_headers(),
             }),
             ("POST", "/v2/pipeline") => {
                 debug!("Handling /v2/pipeline request");
@@ -172,6 +151,7 @@ impl TursoSyncServer {
                     status: 404,
                     content_type: "text/plain".to_string(),
                     body: b"Not Found".to_vec(),
+                    extra_headers: cors_headers(),
                 })
             }
         };
@@ -184,15 +164,18 @@ impl TursoSyncServer {
                     status: 500,
                     content_type: "text/plain".to_string(),
                     body: format!("Internal Server Error: {e}").into_bytes(),
+                    extra_headers: cors_headers(),
                 }
             }
         };
 
         let response_bytes = format_http_response(&http_response);
-        stream.write_all(&response_bytes)?;
-        stream.flush()?;
-
-        Ok(())
+        write_response_bounded(
+            &mut stream,
+            &response_bytes,
+            WRITE_DEADLINE,
+            &self.interrupt_count,
+        )
     }
 
     fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {
@@ -231,6 +214,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/json".to_string(),
             body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -640,6 +624,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -760,6 +745,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -804,6 +790,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -839,6 +826,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -871,10 +859,20 @@ impl TursoSyncServer {
     }
 }
 
-struct HttpResponse {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
+/// This server's answer, unchanged, to every request from any origin: it has
+/// no session state and no cookies for a browser to carry, so the wildcard
+/// this predates costs it nothing. The MCP transport does not get to make
+/// the same call - see `cli/mcp/http.rs`.
+fn cors_headers() -> Vec<(String, String)> {
+    vec![
+        ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            "GET, POST, OPTIONS".to_string(),
+        ),
+        ("Access-Control-Allow-Headers".to_string(), "*".to_string()),
+        ("Access-Control-Expose-Headers".to_string(), "*".to_string()),
+    ]
 }
 
 struct MvccLogSnapshot {
@@ -1142,80 +1140,6 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
 
-/// A client controls Content-Length, so the end of the body has to be
-/// computed without trusting it to fit.
-fn request_end(header_end: usize, content_length: usize) -> Result<usize> {
-    (header_end + 4)
-        .checked_add(content_length)
-        .ok_or_else(|| anyhow!("HTTP request length overflows: {content_length}"))
-}
-
-fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
-    (start..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            let value = line.split(':').nth(1)?.trim();
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
-    let header_end = find_header_end(data, 0).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
-    let headers = String::from_utf8_lossy(&data[..header_end]);
-
-    let first_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("Empty request"))?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        return Err(anyhow!("Invalid request line"));
-    }
-
-    let method = parts[0].to_string();
-    let path = parts[1].to_string();
-    let body = data[header_end + 4..].to_vec();
-
-    Ok((method, path, body))
-}
-
-fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
-    let status_text = match resp.status {
-        200 => "OK",
-        204 => "No Content",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Unknown",
-    };
-
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         Access-Control-Expose-Headers: *\r\n\
-         \r\n",
-        resp.status,
-        status_text,
-        resp.content_type,
-        resp.body.len()
-    );
-
-    let mut result = header.into_bytes();
-    result.extend_from_slice(&resp.body);
-    result
-}
-
 fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
     let mut len = data.len();
     while len >= 0x80 {
@@ -1258,32 +1182,54 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use turso_core::{Connection, DatabaseOpts, SqliteDialect};
 
-    /// Mirrors the read loop: the terminator must be found whatever the chunk
-    /// boundaries, including when it straddles two reads.
-    #[test]
-    fn finds_header_end_across_read_boundaries() {
-        let request = b"POST / HTTP/1.1\r\nHost: x\r\n\r\nbody".to_vec();
-        let expected = find_header_end(&request, 0).expect("terminator is present");
-
-        for chunk in 1..=request.len() {
-            let mut data = Vec::new();
-            let mut found = None;
-            for piece in request.chunks(chunk) {
-                let unscanned = data.len().saturating_sub(3);
-                data.extend_from_slice(piece);
-                if let Some(end) = find_header_end(&data, unscanned) {
-                    found = Some(end);
-                    break;
-                }
-            }
-            assert_eq!(found, Some(expected), "missed terminator at chunk {chunk}");
-        }
+    fn memory_sync_server() -> TursoSyncServer {
+        let (_io, conn) =
+            Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
+                .expect("open memory database");
+        TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            ":memory:".to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .expect("construct sync server")
     }
 
+    /// The wildcard CORS headers predate the MCP transport's Origin check and
+    /// are this server's own long-standing behavior - the check landing for
+    /// MCP must leave this server byte-for-byte unchanged.
     #[test]
-    fn rejects_content_length_that_overflows() {
-        assert!(request_end(0, usize::MAX).is_err());
-        assert_eq!(request_end(10, 5).unwrap(), 19);
+    fn responses_still_carry_all_four_cors_headers() {
+        let server = memory_sync_server();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            stream
+                .write_all(b"OPTIONS /v2/pipeline HTTP/1.1\r\nHost: x\r\n\r\n")
+                .expect("write");
+            stream.shutdown(std::net::Shutdown::Write).ok();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read");
+            response
+        });
+
+        let (stream, _) = listener.accept().expect("accept");
+        server.handle_connection(stream).expect("handle connection");
+        let response = client.join().expect("client thread does not panic");
+        let text = String::from_utf8_lossy(&response);
+
+        for header in [
+            "Access-Control-Allow-Origin: *",
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers: *",
+            "Access-Control-Expose-Headers: *",
+        ] {
+            assert!(text.contains(header), "missing '{header}' in: {text}");
+        }
     }
 }
