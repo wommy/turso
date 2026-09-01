@@ -103,3 +103,29 @@ fn a_request_to_an_unknown_path_returns_404() {
 
     assert_eq!(status_code(&response), "404", "response: {response}");
 }
+
+/// A wildcard `Access-Control-Allow-Origin` hands a browser permission to
+/// read the response regardless of Origin, which would defeat the Origin
+/// check the MCP spec requires (a DNS-rebinding defense). The MCP transport
+/// must not emit any CORS header at all.
+#[test]
+fn responses_carry_no_cors_headers() {
+    let (mut child, port) = start_mcp_http_server();
+
+    let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+
+    let response = send_http_request(port, &request);
+    child.kill().ok();
+    child.wait().ok();
+
+    assert_eq!(status_code(&response), "200", "response: {response}");
+    assert!(
+        !response.contains("Access-Control-"),
+        "MCP response must carry no Access-Control-* header: {response}"
+    );
+}

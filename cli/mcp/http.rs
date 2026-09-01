@@ -87,6 +87,7 @@ impl TursoMcpServer {
                 status: 404,
                 content_type: "text/plain".to_string(),
                 body: b"Not Found".to_vec(),
+                extra_headers: Vec::new(),
             }
         };
 
@@ -109,6 +110,7 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
         status: 200,
         content_type: "application/json".to_string(),
         body: body.into_bytes(),
+        extra_headers: Vec::new(),
     }
 }
 
@@ -191,6 +193,7 @@ fn header_mismatch(id: Option<Value>, message: impl Into<String>) -> HttpRespons
         status: 400,
         content_type: "application/json".to_string(),
         body: serde_json::to_vec(&response).unwrap_or_default(),
+        extra_headers: Vec::new(),
     }
 }
 

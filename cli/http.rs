@@ -9,6 +9,11 @@ pub struct HttpResponse {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Headers beyond the ones every response carries (`Content-Type`,
+    /// `Content-Length`, `Connection`). CORS is why this exists: a wildcard
+    /// `Access-Control-Allow-Origin` is not safe for every server this code
+    /// serves, so each one now opts in to what it sends explicitly.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 pub fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -133,21 +138,23 @@ pub fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
         _ => "Unknown",
     };
 
-    let header = format!(
+    let mut header = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         Access-Control-Expose-Headers: *\r\n\
-         \r\n",
+         Connection: close\r\n",
         resp.status,
         status_text,
         resp.content_type,
         resp.body.len()
     );
+    for (name, value) in &resp.extra_headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
 
     let mut result = header.into_bytes();
     result.extend_from_slice(&resp.body);

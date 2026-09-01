@@ -124,6 +124,7 @@ impl TursoSyncServer {
                 status: 204,
                 content_type: "text/plain".to_string(),
                 body: Vec::new(),
+                extra_headers: cors_headers(),
             }),
             ("POST", "/v2/pipeline") => {
                 debug!("Handling /v2/pipeline request");
@@ -139,6 +140,7 @@ impl TursoSyncServer {
                     status: 404,
                     content_type: "text/plain".to_string(),
                     body: b"Not Found".to_vec(),
+                    extra_headers: cors_headers(),
                 })
             }
         };
@@ -151,6 +153,7 @@ impl TursoSyncServer {
                     status: 500,
                     content_type: "text/plain".to_string(),
                     body: format!("Internal Server Error: {e}").into_bytes(),
+                    extra_headers: cors_headers(),
                 }
             }
         };
@@ -198,6 +201,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/json".to_string(),
             body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -607,6 +611,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -727,6 +732,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -771,6 +777,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -806,6 +813,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            extra_headers: cors_headers(),
         })
     }
 
@@ -836,6 +844,22 @@ impl TursoSyncServer {
 
         Ok((db_size, pages))
     }
+}
+
+/// This server's answer, unchanged, to every request from any origin: it has
+/// no session state and no cookies for a browser to carry, so the wildcard
+/// this predates costs it nothing. The MCP transport does not get to make
+/// the same call - see `cli/mcp/http.rs`.
+fn cors_headers() -> Vec<(String, String)> {
+    vec![
+        ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            "GET, POST, OPTIONS".to_string(),
+        ),
+        ("Access-Control-Allow-Headers".to_string(), "*".to_string()),
+        ("Access-Control-Expose-Headers".to_string(), "*".to_string()),
+    ]
 }
 
 struct MvccLogSnapshot {
@@ -1139,5 +1163,60 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use turso_core::{Connection, DatabaseOpts, SqliteDialect};
+
+    fn memory_sync_server() -> TursoSyncServer {
+        let (_io, conn) =
+            Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
+                .expect("open memory database");
+        TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            ":memory:".to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .expect("construct sync server")
+    }
+
+    /// The wildcard CORS headers predate the MCP transport's Origin check and
+    /// are this server's own long-standing behavior - the check landing for
+    /// MCP must leave this server byte-for-byte unchanged.
+    #[test]
+    fn responses_still_carry_all_four_cors_headers() {
+        let server = memory_sync_server();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            stream
+                .write_all(b"OPTIONS /v2/pipeline HTTP/1.1\r\nHost: x\r\n\r\n")
+                .expect("write");
+            stream.shutdown(std::net::Shutdown::Write).ok();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read");
+            response
+        });
+
+        let (stream, _) = listener.accept().expect("accept");
+        server.handle_connection(stream).expect("handle connection");
+        let response = client.join().expect("client thread does not panic");
+        let text = String::from_utf8_lossy(&response);
+
+        for header in [
+            "Access-Control-Allow-Origin: *",
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers: *",
+            "Access-Control-Expose-Headers: *",
+        ] {
+            assert!(text.contains(header), "missing '{header}' in: {text}");
+        }
     }
 }
