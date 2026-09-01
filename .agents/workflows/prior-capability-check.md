@@ -13,12 +13,18 @@ the work, when the options are worse.
 
 ## Trigger
 
-**Event.** A decision to build a new capability — a server, a transport, a tool
-surface, a test harness, a binding, a CLI mode. Not a bug fix, not a slice of
-something already agreed.
+**Armed by [`periodic-sweeps`](periodic-sweeps.md), on a count.** This file is
+the method; that one is what fires it.
 
-The trigger fires on the *decision*, not the first commit. Once code exists the
-loop has already failed.
+It used to say "Event: a decision to build a new capability", and it never
+fired once — nobody experiences deciding to build a capability, they
+experience writing the next obvious commit. [ADR
+0006](../adr/0006-arm-a-loop-by-counting-not-by-noticing.md) records why that
+shape of trigger cannot work and what replaced it.
+
+Running late is worth much more than not running. The ideal is still before
+the first commit; the realistic version is before the branch is offered
+upstream, while the answer can still change what gets sent.
 
 ## Steps
 

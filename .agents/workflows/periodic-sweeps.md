@@ -22,10 +22,11 @@ What that missed, all found by accident:
 Neither is the kind of thing a per-slice review finds. Both need a pass whose
 unit is the whole change, not the commit.
 
-`prior-capability-check` was supposed to prevent the first and did not fire:
-its trigger is "a decision to build a new capability", and nobody ever
-consciously made one. The slices simply proceeded. A trigger that depends on
-somebody noticing they are at a decision point is not a trigger.
+`prior-capability-check` was supposed to prevent the first and never fired
+once. Its trigger asked somebody to notice they were at a decision point, and
+nobody was: the slices were simply the next obvious commit each time. [ADR
+0006](../adr/0006-arm-a-loop-by-counting-not-by-noticing.md) records that, and
+is the reason this loop counts commits instead.
 
 ## Trigger
 
@@ -43,7 +44,7 @@ Run as parallel read-only agents. They do not conflict — none of them writes.
 |---|---|
 | **Two-axis review** | Does the composite follow our standards, and does it do what the spec asked? The `code-review` skill, against a commit rather than a working tree. |
 | **What did we lose** | Diff the branch against whatever it replaced. Anything the old version did that no spec clause demands is what a spec-driven rewrite drops. |
-| **What already exists here** | Did we hand-roll something the workspace already has? A crate already in `Cargo.lock` costs nothing; a new dependency is a real cost and may justify the hand-rolled version. |
+| **What already exists here** | Did we hand-roll something the workspace already has? The method is [`prior-capability-check`](prior-capability-check.md), which this loop exists to arm — do not restate it in the brief, point the agent at it. |
 | **Where does upstream repeat itself** | Their duplication, not ours. Findable with the fix history as an index, and the strongest shape is one copy getting a bug fix the other did not. |
 
 The first two are about this branch. The last two are about the codebase and
