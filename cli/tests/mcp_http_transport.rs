@@ -3,10 +3,25 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// Owns a spawned `tursodb` child and kills it on drop, so a panic anywhere
+/// after this returns - most notably one of `send_http_request`'s
+/// `.expect()` calls - still frees the port instead of leaving an orphan
+/// bound to it. (`postgres/cli/tests/tursopg.rs` kills its child by hand
+/// with no such guard and can leak the same way; this test does not repeat
+/// that.)
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
 /// Reserves a port by binding it in this process first, so two tests
 /// starting at once cannot compute the same port and race for it. Retries
 /// the whole reserve-and-spawn if the child loses the bind anyway.
-fn start_mcp_http_server() -> (Child, u16) {
+fn start_mcp_http_server() -> (ChildGuard, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -28,7 +43,7 @@ fn start_mcp_http_server() -> (Child, u16) {
                 break;
             }
             if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (child, port);
+                return (ChildGuard(child), port);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -69,7 +84,7 @@ fn body(response: &str) -> &str {
 
 #[test]
 fn a_post_of_tools_list_returns_200_with_a_non_empty_tools_array() {
-    let (mut child, port) = start_mcp_http_server();
+    let (_child, port) = start_mcp_http_server();
 
     let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
     let request = format!(
@@ -79,8 +94,6 @@ fn a_post_of_tools_list_returns_200_with_a_non_empty_tools_array() {
     );
 
     let response = send_http_request(port, &request);
-    child.kill().ok();
-    child.wait().ok();
 
     assert_eq!(status_code(&response), "200", "response: {response}");
 
@@ -94,12 +107,10 @@ fn a_post_of_tools_list_returns_200_with_a_non_empty_tools_array() {
 
 #[test]
 fn a_request_to_an_unknown_path_returns_404() {
-    let (mut child, port) = start_mcp_http_server();
+    let (_child, port) = start_mcp_http_server();
 
     let request = "GET /unknown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
     let response = send_http_request(port, request);
-    child.kill().ok();
-    child.wait().ok();
 
     assert_eq!(status_code(&response), "404", "response: {response}");
 }
@@ -110,7 +121,7 @@ fn a_request_to_an_unknown_path_returns_404() {
 /// must not emit any CORS header at all.
 #[test]
 fn responses_carry_no_cors_headers() {
-    let (mut child, port) = start_mcp_http_server();
+    let (_child, port) = start_mcp_http_server();
 
     let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
     let request = format!(
@@ -120,8 +131,6 @@ fn responses_carry_no_cors_headers() {
     );
 
     let response = send_http_request(port, &request);
-    child.kill().ok();
-    child.wait().ok();
 
     assert_eq!(status_code(&response), "200", "response: {response}");
     assert!(
@@ -151,7 +160,7 @@ fn tools_list_request(origin: Option<&str>) -> String {
 /// that without losing per-case coverage or messages.
 #[test]
 fn origin_validation_matches_the_documented_loopback_policy() {
-    let (mut child, port) = start_mcp_http_server();
+    let (_child, port) = start_mcp_http_server();
 
     let cases: &[(&str, Option<&str>, &str)] = &[
         ("no Origin header at all is allowed", None, "200"),
@@ -208,7 +217,24 @@ fn origin_validation_matches_the_documented_loopback_policy() {
             "{description} (Origin: {origin:?}) -> response: {response}"
         );
     }
+}
 
-    child.kill().ok();
-    child.wait().ok();
+/// Proves `ChildGuard::drop` actually runs on a panic, rather than just
+/// renaming the old manual `kill`/`wait` calls. A closure that panics while
+/// holding the guard is the defect this file used to have: any `.expect()`
+/// in `send_http_request` panicking before the manual cleanup ran left the
+/// child alive and bound to its port. If the guard works, the port is free
+/// again the moment `catch_unwind` returns.
+#[test]
+fn a_panic_while_holding_the_guard_still_frees_the_port() {
+    let (guard, port) = start_mcp_http_server();
+
+    let panicked = std::panic::catch_unwind(move || {
+        let _guard = guard;
+        panic!("deliberate panic to exercise ChildGuard::drop");
+    });
+    assert!(panicked.is_err(), "the closure was supposed to panic");
+
+    TcpListener::bind(("127.0.0.1", port))
+        .expect("ChildGuard::drop should have killed the child and freed the port");
 }
