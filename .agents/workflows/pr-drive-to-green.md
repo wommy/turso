@@ -12,10 +12,22 @@ into confident misinformation.
 
 ## Trigger
 
-**Schedule**, roughly hourly while any pull request we own is open; stops when
+**Schedule**, every few hours while any pull request we own is open; stops when
 every one is merged or closed. Not event-driven, deliberately — GitHub webhooks
 miss CI completions and merge-state transitions, so the schedule is the
 backstop and events are a bonus that fires it early.
+
+It was hourly, which made sense while CI was believed to be merely slow. Given
+**CI cannot go green here** below, three of the four things this loop detects
+can only change when somebody pushes: a failure in one of the three workflows
+that run, a stacked branch falling behind, a merge conflict. Our own pushes we
+already know about. So the only event the schedule uniquely catches is the base
+branch moving, which is upstream's to do and is not hourly news — review
+comments arrive on their own through the PR subscription.
+
+Three consecutive hourly firings returned byte-identical results. A loop that
+reports the same thing every hour is training its reader to stop looking, which
+is the failure ADR 0006 is about, arriving by a different road.
 
 ## Steps
 
