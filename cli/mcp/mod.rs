@@ -331,6 +331,22 @@ mod tests {
         assert_eq!(unknown["result"]["protocolVersion"], LEGACY_DEFAULT);
     }
 
+    /// `2025-11-25` is the newest revision that still has a handshake at all
+    /// (later revisions dropped it for `_meta`), so it is exactly what every
+    /// handshake-based client offers. A client asking for a revision we
+    /// support must get that revision back, not a silent downgrade.
+    #[test]
+    fn a_handshake_offering_2025_11_25_is_not_downgraded() {
+        let response = answer(
+            &memory_server(),
+            json!({
+                "jsonrpc": "2.0", "id": 10, "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25" },
+            }),
+        );
+        assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+    }
+
     #[test]
     fn an_unknown_method_is_method_not_found() {
         let response = answer(
