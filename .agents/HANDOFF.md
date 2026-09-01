@@ -19,8 +19,7 @@ That dies with the container. This branch is the durable store.
 | 1 | **`WORKTREE.md`** at the root of whichever worktree you are in. Six worktrees, similar names; reading the wrong one has cost two agent runs. **Untracked — it dies with the container.** If absent, `.agents/adr/0001` carries the same content. |
 | 2 | **[Issue #4](https://github.com/wommy/turso/issues/4)** — the map. Destination, decisions, fog. Open children are found by query, deliberately not listed. |
 | 3 | **[Issue #24](https://github.com/wommy/turso/issues/24)** — the B2+D spec. Its **body** is current; its comments are the working record and are superseded by it. |
-| 4 | **`.agents/adr/`** — four decisions not to reopen. 0002 especially: an architecture review already tried to relitigate it. |
-| 5 | **`.agents/config/`** and **`.agents/workflows/`** — how to brief an agent, which jobs get a schema, the three loops. |
+| 4 | **[`README.md`](README.md)** — which of these documents to reach for, and when. Read it once; after that reach for what you need. |
 
 For anything else — what is built, what is open, what is blocked — **query the
 tracker.** Labels carry it: `upstream-report` is everything gated on #22,
@@ -58,8 +57,8 @@ They are now the only things in the map's fog.
 
 Not repeated here. Each lives in a document that is the source of truth for it:
 
-- Verify every agent claim at source — `.agents/config/verify-agent-claims.md`.
-  Ten claims turned out false today; none was caught by tests, all by reading.
+- Verify every agent claim at source — `.agents/config/verify-agent-claims.md`,
+  which keeps the running list of what that has caught.
 - One agent per **worktree**, pre-load briefs rather than describing —
   `.agents/config/background-agents.md`.
 - Pointers, not snapshots — `.agents/workflows/pr-drive-to-green.md`, and this
@@ -67,6 +66,6 @@ Not repeated here. Each lives in a document that is the source of truth for it:
 
 ## Suggested skills
 
-`tdd` for the remaining slices (seams named in #24). `code-review` before
+`tdd` for the remaining slices (seams named in #24). `two-axis-review` before
 anything is offered upstream. **Not `wayfinder`** — its map has cleared; what
 remains is execution.

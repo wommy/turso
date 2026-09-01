@@ -18,12 +18,10 @@ turned them on (Settings → Features → Issues), and issue creation fails with
 Pull requests are unaffected. If a fresh fork ever replaces this one, check this
 first.
 
-**Labels must already exist.** There is no label-creation tool in the GitHub MCP
-server, and `issue_write` does *not* create missing labels — it fails with
-`failed to resolve label`. Create them with `gh label create` from a machine
-that has it (see `triage-labels.md`), then use them. The `wayfinder:*` type
-labels do not exist for this reason, so wayfinder tickets record their type in
-the body instead.
+**Labels must already exist.** `issue_write` does *not* create a missing label —
+it fails with `failed to resolve label`, and the GitHub MCP server has no
+label-creation tool at all. `triage-labels.md` carries the labels and how to
+create them.
 
 ## Two spellings for every operation
 

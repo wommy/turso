@@ -4,8 +4,8 @@ set -euo pipefail
 # Reinstall Matt Pocock's engineering skills in a fresh container.
 #
 # The skills install into ~/.claude/skills and ~/.agents/skills, both outside
-# the repo, so they survive no container restart. This restores them in one
-# command. See .agents/config/README.md.
+# the repo, so they do not survive a container restart. This restores them in one
+# command. See .agents/README.md.
 
 CLONE="${AGENT_SKILLS_CLONE:-$HOME/mattpocock-skills}"
 REMOTE="https://github.com/mattpocock/skills.git"

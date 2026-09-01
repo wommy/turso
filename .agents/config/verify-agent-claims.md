@@ -1,7 +1,5 @@
 # Verify an agent's claims before acting on them
 
-## Why this exists
-
 The highest-yield habit of the MCP port, and the only one that was never written
 down. Across roughly a dozen subagent reports it caught six wrong claims:
 
@@ -17,50 +15,37 @@ down. Across roughly a dozen subagent reports it caught six wrong claims:
 
 Not one was caught by tests. Every one was caught by reading the source.
 
-## Trigger
+This is not a loop — nothing arms it and it has no checkpoint. It runs whenever a
+report arrives carrying claims that will be acted on. Skip it for a report that
+is purely a recommendation with no factual claim, and for one whose claims a
+build is about to test anyway: the compiler is a cheaper verifier than reading.
 
-**Event.** A subagent report arrives carrying claims that will be acted on.
+## How
 
-Skip it for a report that is purely a recommendation with no factual claim, and
-for one whose claims are about to be tested by a build anyway — the compiler is
-a cheaper verifier than reading.
-
-## Steps
-
-1. Extract the falsifiable claims. A claim is falsifiable if it names a file, a
+1. **Read the report's fields, not its closing summary.** A summary can smooth
+   over a failure; `checks[].result` cannot.
+2. Extract the falsifiable claims. A claim is falsifiable if it names a file, a
    line, a count, a quote, or an absence.
-2. Rank by **what would break if it were false**. Verify in that order, not in
-   report order. A wrong line number is cosmetic; a wrong claim about what a
+3. Rank by **what would break if it were false**, and verify in that order rather
+   than report order. A wrong line number is cosmetic; a wrong claim about what a
    spec requires changes the code.
-3. Check each against the primary source — the file, the spec text, the git
+4. Check each against the primary source — the file, the spec text, the git
    history. Not against another agent's report.
-4. Give special weight to two shapes, because both have failed here:
+5. Give special weight to two shapes, because both have failed here:
    - **Absence claims.** "Nothing else references this", "no missing items",
      "not mentioned anywhere". A confident enumerator fails in the
      did-you-find-everything direction.
-   - **Claims that contradict something already written down.** These are
-     either the most valuable finding in the report or the worst error in it,
-     and the two look identical until checked.
-5. Record corrections where the wrong claim lived — the ticket, the spec, the
+   - **Claims that contradict something already written down.** These are either
+     the most valuable finding in the report or the worst error in it, and the
+     two look identical until checked.
+6. Record corrections where the wrong claim lived — the ticket, the spec, the
    ADR — not only in the reply. An uncorrected artifact re-teaches the error.
 
-## Checkpoint
+State corrections plainly in whatever report follows and move on: no tallying of
+agent failures, no ceremony. What the reader needs is the corrected fact, not the
+story of how it was wrong.
 
-**None.** This runs autonomously. Corrections surface in the normal report back
-to the human.
-
-## Push right
-
-Not applicable: there is no human in this loop. The discipline it replaces is
-the human having to distrust every report themselves.
-
-## Brief
-
-Fold into whatever report follows. State corrections plainly and move on — no
-tallying of agent failures, no ceremony. What the reader needs is the corrected
-fact, not the story of how it was wrong.
-
-## Definition of done
+## Done when
 
 Every claim that would change what gets built has been checked, or is explicitly
 marked unverified. "Not established" is a valid resting state; a claim silently
