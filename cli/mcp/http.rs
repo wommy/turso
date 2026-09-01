@@ -103,10 +103,8 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
             return forbidden_origin(origin);
         }
     }
-    if let Ok(request) = serde_json::from_slice::<Value>(&req.body) {
-        if let Err(response) = validate_headers(req, &request) {
-            return response;
-        }
+    if let Err(response) = validate_headers(req) {
+        return response;
     }
     let body = server
         .handle_message(&String::from_utf8_lossy(&req.body))
@@ -173,23 +171,28 @@ fn forbidden_origin(origin: &str) -> HttpResponse {
 
 /// The spec's request-metadata headers, checked against the JSON-RPC body
 /// before the request is routed at all - a mismatch must never reach a tool.
-fn validate_headers(req: &HttpRequest, request: &Value) -> Result<(), HttpResponse> {
-    let id = request.get("id").cloned();
+///
+/// Header presence, duplicates, and character validity are checked whether
+/// or not the body parses as JSON: a client that sends no `Mcp-Method` at
+/// all must get the same 400 whether its body is `{"method":...}` or
+/// garbage. Only the comparison *against* a body value needs that value, so
+/// an unparseable body short-circuits after the header-only checks - the
+/// parse error itself is reported by `handle_message` below, not duplicated
+/// here.
+fn validate_headers(req: &HttpRequest) -> Result<(), HttpResponse> {
+    let parsed_body = serde_json::from_slice::<Value>(&req.body).ok();
+    let id = parsed_body
+        .as_ref()
+        .and_then(|body| body.get("id").cloned());
 
-    for (name, value) in &req.headers {
-        if !is_valid_header_value(value) {
-            return Err(header_mismatch(
-                id,
-                format!("Header '{name}' contains invalid characters"),
-            ));
-        }
-    }
+    let header_method = checked_header(req, "Mcp-Method", id.clone())?
+        .ok_or_else(|| header_mismatch(id.clone(), "Missing required header: Mcp-Method"))?;
+
+    let Some(request) = parsed_body else {
+        return Ok(());
+    };
 
     let body_method = request.get("method").and_then(Value::as_str).unwrap_or("");
-
-    let header_method = req
-        .header("Mcp-Method")
-        .ok_or_else(|| header_mismatch(id.clone(), "Missing required header: Mcp-Method"))?;
     if header_method != body_method {
         return Err(header_mismatch(
             id,
@@ -213,8 +216,7 @@ fn validate_headers(req: &HttpRequest, request: &Value) -> Result<(), HttpRespon
             .and_then(|params| params.get(name_field))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let header_name = req
-            .header("Mcp-Name")
+        let header_name = checked_header(req, "Mcp-Name", id.clone())?
             .ok_or_else(|| header_mismatch(id.clone(), "Missing required header: Mcp-Name"))?;
         if header_name != body_name {
             return Err(header_mismatch(
@@ -232,6 +234,49 @@ fn validate_headers(req: &HttpRequest, request: &Value) -> Result<(), HttpRespon
 /// The methods where the spec's `Mcp-Name` header carries `params.name` (or
 /// `params.uri` for a resource) and must be validated against the body.
 const NAME_REQUIRED_METHODS: [&str; 3] = ["tools/call", "resources/read", "prompts/get"];
+
+/// Looks up `name` the way `header()` does, but - like `parse_content_length`
+/// in `cli/http.rs` for a duplicated `Content-Length` - refuses to silently
+/// pick a winner when the header repeats with disagreeing values. `Mcp-Method`
+/// exists so an intermediary can route a request without parsing its body; if
+/// a duplicate reaches this function, an intermediary reading the same
+/// headers may have routed on a different value than `header()`'s
+/// first-match would compare against, so this server and the router could
+/// act on different values without either of them noticing. RFC 9110 5.3
+/// still permits a header to repeat as long as every occurrence agrees, so
+/// identical repeats stay legal.
+///
+/// Character validity (RFC 9110 5.5: visible ASCII, space, or tab) is
+/// checked here too, scoped to just the headers this function is asked
+/// about - `Mcp-Method` and `Mcp-Name` - rather than every header on the
+/// request. This server does not read the others, so it has no business
+/// rejecting `obs-text` bytes in them.
+fn checked_header<'a>(
+    req: &'a HttpRequest,
+    name: &str,
+    id: Option<Value>,
+) -> Result<Option<&'a str>, HttpResponse> {
+    let mut found: Option<&str> = None;
+    for (key, value) in &req.headers {
+        if !key.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if !is_valid_header_value(value) {
+            return Err(header_mismatch(
+                id,
+                format!("Header '{name}' contains invalid characters"),
+            ));
+        }
+        if found.is_some_and(|first| first != value) {
+            return Err(header_mismatch(
+                id,
+                format!("Conflicting '{name}' headers: request carries disagreeing values"),
+            ));
+        }
+        found = Some(value.as_str());
+    }
+    Ok(found)
+}
 
 /// RFC 9110 5.5: a header field value is visible ASCII (0x21-0x7E), space
 /// (0x20), or horizontal tab (0x09). Anything else - a control character or a
@@ -412,6 +457,129 @@ mod tests {
                 ("Mcp-Method".to_string(), "tools/call".to_string()),
                 ("Mcp-Name".to_string(), "list_tables\u{0007}".to_string()),
             ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32020);
+    }
+
+    /// `params.name` and the `Mcp-Name` header are made to agree so the only
+    /// thing that can still fail this request is the disagreeing pair of
+    /// `Mcp-Method` headers - otherwise a currently-missing `Mcp-Name` would
+    /// also produce 400 and hide whether the duplicate-header defect was
+    /// ever exercised.
+    #[test]
+    fn two_disagreeing_mcp_method_headers_are_rejected() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_tables", "arguments": {} },
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+                ("Mcp-Name".to_string(), "list_tables".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn two_identical_mcp_method_headers_are_accepted() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200);
+    }
+
+    /// A malformed body must not make header validation a no-op: the missing
+    /// `Mcp-Method` header is rejected the same way it would be with a valid
+    /// body, instead of falling through to `handle_message` and coming back
+    /// 200 with an embedded JSON-RPC parse error.
+    #[test]
+    fn an_unparseable_body_with_no_mcp_method_header_is_still_rejected() {
+        let server = memory_server();
+        let req = HttpRequest {
+            headers: vec![],
+            body: b"not json".to_vec(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32020);
+    }
+
+    /// The character check exists to police the two headers this function
+    /// actually reads, not every header on the request - `obs-text` bytes in
+    /// a header nobody compares against the body are none of its business.
+    #[test]
+    fn an_unrelated_header_with_non_ascii_bytes_is_accepted() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![
+                ("Mcp-Method".to_string(), "tools/list".to_string()),
+                ("X-Trace".to_string(), "café".to_string()),
+            ],
+            body: request_body.into_bytes(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn invalid_characters_in_mcp_method_itself_are_still_rejected() {
+        let server = memory_server();
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list\u{0007}",
+            "params": {},
+        })
+        .to_string();
+
+        let req = HttpRequest {
+            headers: vec![("Mcp-Method".to_string(), "tools/list\u{0007}".to_string())],
             body: request_body.into_bytes(),
         };
 
