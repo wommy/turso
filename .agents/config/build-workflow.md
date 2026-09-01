@@ -1,8 +1,23 @@
-# Building this repo without running out of disk
+# Building and testing this repo in this container
+
 
 A single `target/` reaches 9 GB. Three worktrees exhausted the container's disk
 entirely. These are the measures that actually moved the number, with the ones
 that did not, so they are not tried again.
+
+## Run the CLI tests serially
+
+    cargo test -p turso_cli -- --test-threads=1
+
+`cli/tests/mcp_http_transport.rs` spawns real `tursodb` processes and binds
+real ports. Under cargo's default parallelism a different test in that file
+fails at random with `ConnectionRefused` or `ConnectionReset`; serially all
+five pass. Two agents hit this independently and one nearly reported it as a
+regression in the code it was changing.
+
+Nobody has reproduced the race deliberately yet, so the cause is still open
+as [#41](https://github.com/wommy/turso/issues/41). Until that closes, the
+flag is how you tell a real failure from this one.
 
 ## The inner loop
 

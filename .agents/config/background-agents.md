@@ -69,9 +69,19 @@ caught a false claim in a brief twice.
   one checkout collide on the index. One of them stashed two others' work when I
   wrongly read its commits as finished. Give each its own worktree and name the
   directories the others own.
+- **Point at the discipline, do not re-type it.** The same instinct as the
+  bullet above, applied to rules instead of code. "Test both directions", "run
+  it against the pre-fix commit", "isolate the test so a neighbour's build
+  failure does not hide the answer" all live in
+  [`../adr/0005-both-directions-of-a-guard-need-a-test.md`](../adr/0005-both-directions-of-a-guard-need-a-test.md),
+  reachable from every worktree as `.agents-ref/adr/`. Restating them in each
+  brief costs a paragraph a time and gives the discipline two homes that can
+  disagree. Name the ADR and say you are deliberately not summarising it.
+  Where an ADR already *is* the slice's spec — 0004 is slice 9's — the brief
+  shrinks to the pointer, the file to change, and the one judgement call.
 - **Require the negative proof.** For a bug fix, the tests must be shown to fail
   without the change. Upstream asks for this explicitly and it matters most when
-  the tests were written by a model.
+  the tests were written by a model. Per ADR 0005 above; do not respell it.
 
 Investigation briefs take all of this except the shape — say what counts as a
 finding, forbid the foreseeable workarounds, demand honesty about confidence, and
