@@ -4,9 +4,22 @@
 
 Turso ships two MCP servers with no shared code, no shared naming, and no
 mention of each other. We ported one of them without knowing the other existed,
-and found out afterwards. The same shape recurs across the organisation: two
-HTTP servers on different concurrency models, two differential-testing harnesses
-with separate SQL generators, two SDK kits, seven test harnesses.
+and found out afterwards. The second lives in a **different repository**,
+`tursodatabase/turso-mcp` — which is the point: searching the monorepo would
+never have found it.
+
+Two of the other pairs this file used to assert have since been checked and are
+**not** what they looked like. There is only one hand-rolled HTTP server in the
+monorepo (`cli/sync_server.rs`); the Postgres wire server uses `pgwire` and
+shares no parsing code. And the two SQL generators (`sql_generation/` and
+`testing/differential-oracle/sql_gen/`) are legitimately separate — a
+value-shadowing simulator against a schema-introspection fuzzer — checked by
+taking the deepest known bug in one and confirming the code path does not exist
+in the other. Same for the two SDK kits: mirrored file layout, no shared logic.
+
+Left in place because the correction is the lesson. Four of five "obvious
+duplicates" dissolved on inspection, and the one that survived was in another
+repository entirely.
 
 The cost is not the duplication itself. It is that the discovery arrives *after*
 the work, when the options are worse.
