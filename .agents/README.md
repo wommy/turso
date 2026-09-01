@@ -35,7 +35,7 @@ made here, on this branch.
 | **Naming an MCP protocol revision** | [`CONTEXT.md`](CONTEXT.md) |
 | **Adding a guard, or a test for one, in the MCP work** | [`config/mcp-guard-audit.md`](config/mcp-guard-audit.md) |
 | **About to reopen a settled decision** | [`adr/`](adr/) |
-| **A scheduled loop needs arming or re-arming** | [`workflows/`](workflows/) |
+| **A scheduled loop needs arming or re-arming, or ~5 slices have landed** | [`workflows/`](workflows/) |
 | **Writing something aimed at `tursodatabase/turso`** | [`upstream-drafts/`](upstream-drafts/) |
 
 ## The skills

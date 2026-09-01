@@ -13,6 +13,7 @@ way the spec now prevents. Where a genuine question remains it is marked
 |---|---|---|
 | [prior-capability-check](prior-capability-check.md) | event: a new capability is proposed | only when something is found |
 | [pr-drive-to-green](pr-drive-to-green.md) | schedule: hourly while a PR is open | only on ambiguous failures |
+| [periodic-sweeps](periodic-sweeps.md) | count: every ~5 slices, or before offering upstream | only when a sweep changes the plan |
 
 **`verify-agent-claims` is not here, deliberately.** It was written as a
 workflow and is not one: nothing external arms it, it has no checkpoint, and its
