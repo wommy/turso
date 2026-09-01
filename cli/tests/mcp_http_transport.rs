@@ -129,3 +129,86 @@ fn responses_carry_no_cors_headers() {
         "MCP response must carry no Access-Control-* header: {response}"
     );
 }
+
+/// A `tools/list` request, with an optional `Origin` header - the one piece
+/// every case below varies.
+fn tools_list_request(origin: Option<&str>) -> String {
+    let payload = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let origin_line = origin
+        .map(|value| format!("Origin: {value}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\n{origin_line}Content-Length: {}\r\n\r\n{}",
+        payload.len(),
+        payload
+    )
+}
+
+/// One server, every documented case sent to it in turn as a separate
+/// connection - not one spawned `tursodb` process per case. A dozen
+/// concurrently-spawned server processes is what made this file flaky under
+/// full parallelism; a shared server for the whole origin policy removes
+/// that without losing per-case coverage or messages.
+#[test]
+fn origin_validation_matches_the_documented_loopback_policy() {
+    let (mut child, port) = start_mcp_http_server();
+
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        ("no Origin header at all is allowed", None, "200"),
+        (
+            "a non-loopback origin is refused",
+            Some("http://evil.example.com"),
+            "403",
+        ),
+        (
+            "localhost, on any port, is loopback",
+            Some("http://localhost:3000"),
+            "200",
+        ),
+        (
+            "127.0.0.1 is loopback",
+            Some("http://127.0.0.1:8080"),
+            "200",
+        ),
+        ("IPv6 ::1 is loopback", Some("http://[::1]:9000"), "200"),
+        // The whole 127.0.0.0/8 block is loopback to the kernel, not just
+        // 127.0.0.1 - Ipv4Addr::is_loopback is the standard's own
+        // definition, and nothing about the DNS-rebinding concern this
+        // check exists for narrows it further: a page cannot make a
+        // browser reach 127.0.0.2 any more than it can reach 127.0.0.1.
+        (
+            "127.0.0.2, elsewhere in the loopback block, is loopback too",
+            Some("http://127.0.0.2:8080"),
+            "200",
+        ),
+        // A naive contains("localhost") or contains("127.0.0.1") would
+        // accept both of these - the host is parsed out of the authority
+        // and compared whole, so an attacker-controlled suffix cannot ride
+        // along on a substring match.
+        (
+            "a hostname merely suffixed with localhost is refused",
+            Some("http://localhost.evil.com"),
+            "403",
+        ),
+        (
+            "a hostname merely suffixed with a loopback address is refused",
+            Some("http://127.0.0.1.attacker.net"),
+            "403",
+        ),
+        // Origin: null is what a sandboxed iframe or a file:// page sends.
+        // It names no host at all, so it is not loopback.
+        ("the null origin is refused", Some("null"), "403"),
+    ];
+
+    for (description, origin, expected_status) in cases {
+        let response = send_http_request(port, &tools_list_request(*origin));
+        assert_eq!(
+            status_code(&response),
+            *expected_status,
+            "{description} (Origin: {origin:?}) -> response: {response}"
+        );
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+}

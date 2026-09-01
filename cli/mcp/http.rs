@@ -1,4 +1,4 @@
-use super::protocol::{JsonRpcError, JsonRpcResponse, HEADER_MISMATCH};
+use super::protocol::{JsonRpcError, JsonRpcResponse, FORBIDDEN_ORIGIN, HEADER_MISMATCH};
 use super::TursoMcpServer;
 use crate::http::{format_http_response, parse_http_request, read_http_request, HttpResponse};
 use anyhow::Result;
@@ -98,6 +98,11 @@ impl TursoMcpServer {
 }
 
 pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResponse {
+    if let Some(origin) = req.header("Origin") {
+        if !origin_is_loopback(origin) {
+            return forbidden_origin(origin);
+        }
+    }
     if let Ok(request) = serde_json::from_slice::<Value>(&req.body) {
         if let Err(response) = validate_headers(req, &request) {
             return response;
@@ -110,6 +115,58 @@ pub fn http_response_for(server: &TursoMcpServer, req: &HttpRequest) -> HttpResp
         status: 200,
         content_type: "application/json".to_string(),
         body: body.into_bytes(),
+        extra_headers: Vec::new(),
+    }
+}
+
+/// The MCP spec's DNS-rebinding defense: a browser-sent `Origin` that is
+/// present and not loopback is refused before the request is routed at all.
+/// A non-browser client sends no `Origin`, so its absence is allowed - the
+/// spec's own wording is "if present and invalid".
+///
+/// Loopback here is `localhost`, the whole `127.0.0.0/8` block (loopback to
+/// the kernel, not just `127.0.0.1`), and IPv6 `::1`, on any port and any
+/// scheme. The host is parsed out of the authority rather than
+/// substring-matched, so `http://localhost.evil.com` and
+/// `http://127.0.0.1.attacker.net` do not pass as loopback just because they
+/// contain a loopback name. `Origin: null` - a sandboxed iframe or a `file://`
+/// page - names no host and is refused the same way.
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some(host) = origin_host(origin) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The host from an Origin value shaped `scheme://host[:port]` (RFC 6454),
+/// with IPv6's bracket notation unwrapped. `null` and anything else with no
+/// `scheme://` have no host to extract.
+fn origin_host(origin: &str) -> Option<&str> {
+    let authority = origin.split_once("://")?.1;
+    if let Some(v6_and_rest) = authority.strip_prefix('[') {
+        return v6_and_rest.split(']').next();
+    }
+    Some(authority.split(':').next().unwrap_or(authority))
+}
+
+/// The spec allows but does not require a JSON-RPC error body on this 403.
+/// One is included, matching every other error response this server sends,
+/// so a client does not need a special case for the one response whose body
+/// might be empty. The id is always null: a rejected origin gets no benefit
+/// of the doubt, so its body is not parsed just to echo its id back.
+fn forbidden_origin(origin: &str) -> HttpResponse {
+    let error = JsonRpcError::new(FORBIDDEN_ORIGIN, format!("Forbidden origin: {origin}"));
+    let response = JsonRpcResponse::failure(None, error);
+    HttpResponse {
+        status: 403,
+        content_type: "application/json".to_string(),
+        body: serde_json::to_vec(&response).unwrap_or_default(),
         extra_headers: Vec::new(),
     }
 }
@@ -363,5 +420,57 @@ mod tests {
         assert_eq!(response.status, 400);
         let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
         assert_eq!(body["error"]["code"], -32020);
+    }
+
+    /// The end-to-end 403 cases live in tests/mcp_http_transport.rs, which
+    /// exercises the real listener with real request headers. These test the
+    /// parser in isolation, which is where the substring-match trap actually
+    /// lives - a full round trip through a spawned server would prove the
+    /// same thing far more slowly.
+    #[test]
+    fn origin_host_parses_the_authority_out_of_scheme_and_port() {
+        assert_eq!(origin_host("http://localhost:3000"), Some("localhost"));
+        assert_eq!(origin_host("http://127.0.0.1:8080"), Some("127.0.0.1"));
+        assert_eq!(origin_host("http://[::1]:9000"), Some("::1"));
+        assert_eq!(
+            origin_host("https://evil.example.com"),
+            Some("evil.example.com")
+        );
+        assert_eq!(origin_host("null"), None);
+    }
+
+    #[test]
+    fn a_hostname_that_merely_contains_a_loopback_name_is_not_loopback() {
+        assert!(!origin_is_loopback("http://localhost.evil.com"));
+        assert!(!origin_is_loopback("http://127.0.0.1.attacker.net"));
+    }
+
+    #[test]
+    fn the_null_origin_is_not_loopback() {
+        assert!(!origin_is_loopback("null"));
+    }
+
+    #[test]
+    fn the_whole_127_block_is_loopback_not_just_127_0_0_1() {
+        assert!(origin_is_loopback("http://127.0.0.1:1"));
+        assert!(origin_is_loopback("http://127.0.0.2:1"));
+        assert!(origin_is_loopback("http://127.1.1.1:1"));
+    }
+
+    #[test]
+    fn a_request_with_a_forbidden_origin_is_rejected_before_the_body_is_even_read() {
+        let server = memory_server();
+        // A body that would fail every other check the server runs - proof
+        // the origin check runs first and short-circuits them all.
+        let req = HttpRequest {
+            headers: vec![("Origin".to_string(), "http://evil.example.com".to_string())],
+            body: b"not even json".to_vec(),
+        };
+
+        let response = http_response_for(&server, &req);
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body).expect("body is valid JSON-RPC");
+        assert_eq!(body["error"]["code"], -32021);
     }
 }
