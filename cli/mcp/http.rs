@@ -50,6 +50,19 @@ const REJECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// `route_request`).
 const ENDPOINT_PATH: &str = "/mcp";
 
+/// What `run_http` prints to stderr once its socket is bound, so a caller
+/// that asked for `127.0.0.1:0` has some way to learn the port the kernel
+/// actually gave it - there is no other way to find out. Stdout stays silent
+/// for this the same as everything else in `run_http`: this binary also
+/// speaks stdio MCP (`--mcp`), where a stray byte on stdout corrupts the
+/// protocol, so every diagnostic here already goes to stderr instead.
+///
+/// `cli/tests/mcp_http_transport.rs` cannot import this constant - `turso_cli`
+/// has no library target for an integration test to link against - so it
+/// matches the same literal text and address format by hand. Keep the two in
+/// sync.
+const LISTENING_ON_PREFIX: &str = "tursodb: MCP HTTP transport listening on ";
+
 pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -70,6 +83,7 @@ impl TursoMcpServer {
     pub fn run_http(&self, address: &str) -> Result<()> {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
+        eprintln!("{LISTENING_ON_PREFIX}{}", listener.local_addr()?);
 
         let interrupt_count = self.interrupt_count.clone();
         let shutdown_flag = Arc::new(AtomicBool::new(false));

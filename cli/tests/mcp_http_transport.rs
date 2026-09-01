@@ -1,7 +1,8 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// Owns a spawned `tursodb` child and kills it on drop, so a panic anywhere
 /// after this returns - most notably one of `send_http_request`'s
@@ -18,39 +19,95 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Reserves a port by binding it in this process first, so two tests
-/// starting at once cannot compute the same port and race for it. Retries
-/// the whole reserve-and-spawn if the child loses the bind anyway.
-fn start_mcp_http_server() -> (ChildGuard, u16) {
-    for _ in 0..10 {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-            .arg(":memory:")
-            .arg("--mcp-http")
-            .arg(&addr)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start tursodb");
+/// The exact text `cli/mcp/http.rs`'s `LISTENING_ON_PREFIX` writes to stderr
+/// once its socket is bound - duplicated here because `turso_cli` is a
+/// binary crate with no library target this file could import the constant
+/// from. Keep the two in sync.
+const LISTENING_ON_PREFIX: &str = "tursodb: MCP HTTP transport listening on ";
 
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                break;
+/// How long to wait for the child to print its bound address before giving
+/// up. Generous, because a loaded box - not a hung child - is the ordinary
+/// reason this takes a while, but still bounded: a child that never prints
+/// (a regression in `run_http` itself) must fail this test, not hang it.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reads the child's stderr on its own thread until it finds the line
+/// `run_http` prints once bound, then sends the port on `tx` and returns.
+/// Runs on its own thread because the pipe is a blocking reader attached to
+/// a child that keeps running: reading it inline on the caller's thread
+/// would block that thread for as long as the child stays alive whenever the
+/// line never comes.
+fn watch_for_bound_port(stderr: ChildStderr, tx: mpsc::Sender<u16>) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return, // EOF or a read error: the child is gone before printing
+            Ok(_) => {
+                let Some(addr) = line.trim_end().strip_prefix(LISTENING_ON_PREFIX) else {
+                    continue;
+                };
+                let Ok(addr) = addr.parse::<std::net::SocketAddr>() else {
+                    continue;
+                };
+                let _ = tx.send(addr.port());
+                return;
             }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (ChildGuard(child), port);
-            }
-            std::thread::sleep(Duration::from_millis(100));
         }
-        child.kill().ok();
-        child.wait().ok();
     }
-    panic!("tursodb --mcp-http did not start");
+}
+
+/// Starts `tursodb --mcp-http 127.0.0.1:0` and waits for it to report the
+/// port the kernel actually gave it.
+///
+/// This used to reserve a port itself - bind `127.0.0.1:0` in this process,
+/// read the port back, drop the listener, then spawn a child to bind that
+/// same address - and retry the whole sequence up to ten times because
+/// anything on the box could take the port in the gap between the drop and
+/// the child's own bind (#37). Asking the child to bind `:0` and report back
+/// what it got removes the gap outright: there is no longer a free port
+/// sitting around for anything else to take.
+fn start_mcp_http_server() -> (ChildGuard, u16) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg("--mcp-http")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start tursodb");
+
+    let stderr = child.stderr.take().expect("child stderr was piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || watch_for_bound_port(stderr, tx));
+
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(port) => return (ChildGuard(child), port),
+            Err(RecvTimeoutError::Disconnected) => {
+                child.kill().ok();
+                child.wait().ok();
+                panic!(
+                    "tursodb --mcp-http exited (or closed stderr) before printing its bound address"
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    child.wait().ok();
+                    panic!("tursodb --mcp-http exited early with {status}");
+                }
+                if Instant::now() >= deadline {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!(
+                        "tursodb --mcp-http did not print its bound address within {STARTUP_TIMEOUT:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Sends a raw HTTP request and reads the response until the server closes
