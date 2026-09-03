@@ -54,6 +54,17 @@ is the failure ADR 0006 is about, arriving by a different road.
    its CI can both be green while missing the fix that just landed underneath
    it. Compare with `git merge-base --is-ancestor <base head> <stacked head>`,
    and merge forward when it comes back false.
+
+   **Read the edges off the PRs, never off memory.** `list_pull_requests` with
+   `fields: ["number", "head", "base"]` gives every edge in one small call, and
+   `base.ref` is the only thing that says what a branch is stacked on. Guessing
+   the pairs from what the branches are named got two of three wrong in a
+   single run: a branch whose base is `main` is not stacked at all, and asking
+   `--is-ancestor` about it raises an alarm step 4 does not mean.
+
+   A `main`-based PR sitting behind `main` is that non-alarm. It is work only
+   if it also conflicts, so ask `git merge-tree --write-tree` before touching
+   it. Twenty-five commits behind and merging clean is a PR to leave alone.
 5. For a red check, establish it is ours before fixing: does it name code the
    diff touches, and is it red on the base branch too?
 6. Fix, validate locally, push. One validated push beats three speculative ones.
